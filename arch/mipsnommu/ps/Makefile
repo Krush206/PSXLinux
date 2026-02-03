@@ -15,7 +15,7 @@ O_TARGET := ps.o
 
 all: ps.o
 
-obj-y	 := cdrom.o int-handler.o setup.o irq.o time.o reset.o kbd-no.o
+obj-y	 := cdrom.o int-handler.o setup.o irq.o time.o reset.o kbd-no.o bios.o bios-asm.o
 
 ifdef CONFIG_PSX_PIO_EXTENSION
 obj-y	+= rtc-ps.o
