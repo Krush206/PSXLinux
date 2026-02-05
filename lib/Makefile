@@ -16,4 +16,6 @@ ifneq ($(CONFIG_HAVE_DEC_LOCK),y)
   obj-y += dec_and_lock.o
 endif
 
+subdir-$(CONFIG_PLAYSTATION_LIBPS) += ps
+
 include $(TOPDIR)/Rules.make

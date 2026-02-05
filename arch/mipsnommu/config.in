@@ -288,4 +288,5 @@ bool 'Magic SysRq key' CONFIG_MAGIC_SYSRQ
 if [ "$CONFIG_SMP" != "y" ]; then
    bool 'Run uncached' CONFIG_MIPS_UNCACHED
 fi
+bool 'Build Net Yaroze library' CONFIG_PLAYSTATION_LIBPS
 endmenu
