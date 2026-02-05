@@ -6,16 +6,9 @@
 # unless it's something special (ie not a .c file).
 #
 
-L_TARGET := lib.a
+L_TARGET := libps.a
 
-export-objs := cmdline.o
-
-obj-y := errno.o ctype.o string.o vsprintf.o brlock.o cmdline.o
-
-ifneq ($(CONFIG_HAVE_DEC_LOCK),y) 
-  obj-y += dec_and_lock.o
-endif
-
-subdir-$(CONFIG_PLAYSTATION_LIBPS) += ps
+obj-y += startup.o symusr.o stdef1.o stdef2.o stdef3.o \
+	 stdef4.o stdef5.o stdef6.o stdef7.o stdef8.o
 
 include $(TOPDIR)/Rules.make
