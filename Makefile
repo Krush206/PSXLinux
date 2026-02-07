@@ -128,7 +128,7 @@ export SVGA_MODE = -DSVGA_MODE=NORMAL_VGA
 
 #export RAMDISK = -DRAMDISK=512
 
-CORE_FILES	=kernel/kernel.o fs/fs.o ipc/ipc.o
+CORE_FILES	=kernel/kernel.o
 NETWORKS	=net/network.o
 DRIVERS		=drivers/block/block.o \
 		 drivers/char/char.o \
@@ -136,7 +136,7 @@ DRIVERS		=drivers/block/block.o \
 		 drivers/net/net.o \
 		 drivers/media/media.o
 LIBS		=$(TOPDIR)/lib/lib.a
-SUBDIRS		=kernel drivers fs net ipc lib
+SUBDIRS		=kernel lib
 
 ifndef CONFIG_UCLINUX
 	CORE_FILES += mm/mm.o
@@ -263,12 +263,10 @@ Version: dummy
 boot: $(LINUX)
 	@$(MAKE) CFLAGS="$(CFLAGS) $(CFLAGS_KERNEL)" -C arch/$(ARCH)/boot
 
-$(LINUX): $(CONFIGURATION) init/main.o init/version.o linuxsubdirs
-	$(LD) $(LINKFLAGS) $(HEAD) init/main.o init/version.o \
+$(LINUX): $(CONFIGURATION) linuxsubdirs
+	$(LD) $(LINKFLAGS) $(HEAD) \
 		--start-group \
 		$(CORE_FILES) \
-		$(DRIVERS) \
-		$(NETWORKS) \
 		$(LIBS) \
 		--end-group \
 		-o $(LINUX)

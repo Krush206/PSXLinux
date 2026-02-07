@@ -20,7 +20,7 @@ O_TARGET := kernel.o
 obj-y				+= branch.o process.o signal.o entry.o \
 				   traps.o ptrace.o vm86.o ioport.o reset.o \
 				   semaphore.o setup.o syscall.o sysmips.o \
-				   ipc.o scall_o32.o unaligned.o
+				   ipc.o scall_o32.o unaligned.o dummy.o init.o
 obj-$(CONFIG_MODULES)		+= mips_ksyms.o
 
 ifdef CONFIG_CPU_R3000
