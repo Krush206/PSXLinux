@@ -36,7 +36,7 @@ extern volatile uint8_t *const CD_REGS;
  * @param params the param buffer, or NULL if length is zero
  * @param params_len parameter length in bytes
  */
-extern inline void cd_command(uint8_t cmd, const uint8_t * params);
+extern void cd_command(uint8_t cmd, const uint8_t * params);
 
 /*
  * Waits for an interrupt to happen, and returns its code.
