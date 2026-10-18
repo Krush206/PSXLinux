@@ -70,12 +70,11 @@ ifeq ($(ARCH),arm)
   endif
 endif
 
-#ifeq ($(ARCH),mipsnommu)
-#    KEYMAP   =defkeymap.o
-#    KEYBD    =../../arch/mipsnommu/ps/psx_kbd.o
-#    CONSOLE  = console.o
-#    	
-#endif
+ifeq ($(ARCH),mipsnommu)
+    KEYMAP   =defkeymap.o
+    KEYBD    =../../arch/mipsnommu/ps/psx_kbd.o
+    CONSOLE  = console.o
+endif
 
 ifeq ($(ARCH),sh)
   KEYMAP   =
