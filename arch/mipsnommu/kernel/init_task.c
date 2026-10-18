@@ -22,9 +22,6 @@ struct mm_struct init_mm = INIT_MM(init_mm);
  *
  * The things we do for performance..
  */
-/* NOTE: ECOFF section names are limited to 8 characters and are
-   truncated on disk, so ".data.init_task" would collide with
-   ".data.init" (both become ".data.in").  Use a short unique name. */
 union task_union init_task_union
-	__attribute__((__section__(".itask"))) =
+	__attribute__((__section__(".data.init_task"))) =
 		{ INIT_TASK(init_task_union.task) };
