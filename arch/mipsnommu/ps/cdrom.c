@@ -24,7 +24,7 @@ inline void cd_set_page(uint8_t page) {
 	CD_REGS[0] = page;
 }
 
-void cd_command(uint8_t cmd, const uint8_t * params) {
+void cd_command(uint8_t cmd, const uint8_t * params, uint8_t param_count) {
 
 	// Wait for previous command to finish, if any
 	while (CD_REGS[0] & 0x80)
@@ -36,10 +36,11 @@ void cd_command(uint8_t cmd, const uint8_t * params) {
 	// Clear read and write FIFOs
 	CD_REGS[3] = 0xC0;
 
-	// Copy request
-	while (params != NULL) {
-		CD_REGS[2] = *params;
-		params++;
+	// Copy parameters (bounded by count)
+	{
+		uint8_t i;
+		for (i = 0; i < param_count; i++)
+			CD_REGS[2] = params[i];
 	}
 
 	// Switch to page 1
@@ -98,7 +99,7 @@ uint8_t cd_read_reply(uint8_t * reply_buffer) {
 }
 
 int cd_drive_init() {
-	cd_command(CD_CMD_INIT, NULL);
+	cd_command(CD_CMD_INIT, NULL, 0);
 
 	// Should succeed with 3
 	if (cd_wait_int() != 3)
@@ -115,7 +116,7 @@ int cd_drive_reset() {
 	unsigned int i;
 
 	// Issue a reset
-	cd_command(CD_CMD_RESET, NULL);
+	cd_command(CD_CMD_RESET, NULL, 0);
 
 	// Should succeed with 3
 	if (cd_wait_int() != 3)
