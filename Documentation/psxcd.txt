@@ -1,0 +1,91 @@
+PSX CD-ROM block driver (psxcd)
+===============================
+
+This adds a native Linux block driver for the PlayStation CD-ROM drive,
+so a disc can be mounted as a normal filesystem (ISO9660).
+
+Components
+----------
+
+  drivers/block/psxcd.c       block device (major 209)
+  drivers/block/psxcd.h       block driver private header
+  arch/mipsnommu/ps/cdrom.c   low-level CD register driver (commands, IRQ,
+                              reply FIFO)
+  include/asm-mipsnommu/ps/cdrom.h  shared low-level API
+
+Configuration
+-------------
+
+  CONFIG_PSX_CDROM      in "Block devices" (only offered on PSX)
+  CONFIG_ISO9660_FS     in "Filesystems"
+
+Device node
+-----------
+
+  mknod /dev/cd0 b 209 0
+  mkdir /cd
+  mount -t iso9660 /dev/cd0 /cd
+
+Notes
+-----
+
+* The driver reads sectors synchronously (SETLOC / SEEK_L / READ_N and
+  a polled interrupt) rather than using DMA channel 3, so it is simple
+  but slow.  DMA can be added later by moving the copy loop into the
+  CD-ROM interrupt handler and programming DMA_MADR3/BCR3/CHCR3.
+
+* ISO9660 is registered from fs/filesystems.c (filesystem_setup)
+  because CONFIG_MODULES is off in this configuration and the usual
+  module_init() hook does not run.
+
+* Register access uses the "index/page" model of the CD controller:
+  register 0 selects page 0 (command/param/status) or page 1 (reply,
+  data and interrupt FIFOs).
+
+Toolchain notes
+---------------
+
+The mipsel-ecoff (net-yaroze) toolchain was extended to build this
+kernel natively:
+
+  binutils/gas/config/tc-mips.c
+      + symbolic register names (zero, at, v0..a0..ra, s8, r0..r31)
+      + .section / .sect / .previous pseudo-ops for ECOFF
+      + .type / .size are accepted and ignored
+      NOTE: the section name passed to subseg_new() must NOT be freed;
+        BFD keeps the pointer (bfd_make_section_anyway stores it in
+        section->name), freeing it left every custom section with a
+        dangling (garbage) name.
+  egcs/gcc/config/mips/ecoffl.h
+      + ASM_OUTPUT_SECTION_NAME (enables __attribute__((section)))
+  bfd/ecoff.c
+      + unknown section indices no longer abort the build
+  bfd/coff-mips.c
+      + custom / absent sections in relocations are tolerated
+      + JMPADDR overflow is only fatal in the final link
+
+ECOFF section names are limited to 8 characters and are truncated
+on disk.  The linker script therefore matches the truncated names,
+and kernel section attributes must be chosen accordingly:
+
+  .text.init  -> .text.in      .setup.init  -> .setup.i
+  .data.init  -> .data.in      .initcall.init -> .initcal
+  __ex_table  -> __ex_tab      .exitcall.init -> .exitcal
+  __dbe_table -> __dbe_tab     .text.exit   -> .text.ex
+  __ksymtab   -> __ksymta      .data.exit   -> .data.ex
+  .data.idt   -> .data.id      .data.cacheline_aligned -> .data.ca
+
+".data.init_task" collided with ".data.init" (both truncate to
+".data.in"), so the init task union lives in the ".itask" section
+(see arch/mipsnommu/kernel/init_task.c and ld.script.in).
+
+Build
+-----
+
+  make
+
+The final link step is done by `make` itself; if it is retried
+manually it is the single `mipsel-ecoff-ld -static -G 0 -T
+arch/mipsnommu/ld.script ... -o linux` command recorded in the build
+log.  The result is a MIPSEL ECOFF executable that can be loaded with
+the net-yaroze `psxfer` tool directly.
