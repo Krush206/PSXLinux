@@ -160,6 +160,8 @@
 #define BU_MAJOR     	207   /* PSX memory card */
 #define PSXCD_MAJOR  	209   /* PSX CD-ROM        */
 #define BU_LARGE_MAJOR  208   /* PSX memory cards joined into one device */
+#define PSXGPU_MAJOR 	210   /* PSX GPU command port */
+#define PSXSPU_MAJOR 	211   /* PSX SPU sound port */
 
 /*
  * Tests for SCSI devices.
