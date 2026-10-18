@@ -41,6 +41,8 @@
 #include <unistd.h>
 #include <elf.h>
 #include <limits.h>
+#include <stdlib.h>
+#include <arpa/inet.h>
 
 #include "ecoff.h"
 
@@ -56,9 +58,10 @@ struct sect {
   unsigned long len;
 };
 
-int phcmp ();
-char *saveRead (int file, off_t offset, off_t len, char *name);
-int copy (int, int, off_t, off_t);
+static int phcmp (const void *, const void *);
+static char *saveRead (int file, off_t offset, off_t len, char *name);
+static void copy (int, int, off_t, off_t);
+static void combine (struct sect *base, struct sect *new, int pad);
 int translate_syms (int, int, off_t, off_t, off_t, off_t);
 void convert_elf_hdr (Elf32_Ehdr *);
 void convert_elf_phdrs (Elf32_Phdr *, int);
@@ -71,7 +74,9 @@ int *symTypeTable;
 int must_convert_endian = 0;
 int format_bigendian = 0;
 
-main (int argc, char **argv, char **envp)
+int main (int argc, char **argv, char **envp);
+
+int main (int argc, char **argv, char **envp)
 {
   Elf32_Ehdr ex;
   Elf32_Phdr *ph;
@@ -428,12 +433,12 @@ fprintf (stderr, "writing %d bytes...\n", ph [i].p_filesz);
   exit (0);
 }
 
-copy (out, in, offset, size)
-     int out, in;
-     off_t offset, size;
+static void
+copy (int out, int in, off_t offset, off_t size)
 {
-  char ibuf [4096];
+  static char ibuf [4096];
   int remaining, cur, count;
+
 
   /* Go the the start of the ELF symbol table... */
   if (lseek (in, offset, SEEK_SET) < 0)
@@ -465,9 +470,8 @@ copy (out, in, offset, size)
 
 /* Combine two segments, which must be contiguous.   If pad is true, it's
    okay for there to be padding between. */
-combine (base, new, pad)
-     struct sect *base, *new;
-     int pad;
+static void
+combine (struct sect *base, struct sect *new, int pad)
 {
   if (!base -> len)
     *base = *new;
@@ -488,9 +492,10 @@ combine (base, new, pad)
     }
 }
 
-phcmp (h1, h2)
-     Elf32_Phdr *h1, *h2;
+static int
+phcmp (const void *a, const void *b)
 {
+  const Elf32_Phdr *h1 = a, *h2 = b;
   if (h1 -> p_vaddr > h2 -> p_vaddr)
     return 1;
   else if (h1 -> p_vaddr < h2 -> p_vaddr)
