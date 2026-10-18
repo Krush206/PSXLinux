@@ -63,6 +63,7 @@ subdir-$(CONFIG_SUN_OPENPROMFS)	+= openpromfs
 
 
 obj-$(CONFIG_BINFMT_AOUT)	+= binfmt_aout.o
+obj-$(CONFIG_BINFMT_ECOFF)	+= binfmt_ecoff.o
 obj-$(CONFIG_BINFMT_EM86)	+= binfmt_em86.o
 obj-$(CONFIG_BINFMT_MISC)	+= binfmt_misc.o
 
