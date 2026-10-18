@@ -109,6 +109,7 @@ fi
 tristate 'Kernel support for flat binaries' CONFIG_BINFMT_FLAT
 dep_bool '   Load flat segments separately' CONFIG_BINFMT_FLAT_SEPARATELY $CONFIG_BINFMT_FLAT
 tristate 'Kernel support for a.out binaries' CONFIG_BINFMT_AOUT
+tristate 'Kernel support for ECOFF binaries' CONFIG_BINFMT_ECOFF
 tristate 'Kernel support for ELF binaries' CONFIG_BINFMT_ELF
 tristate 'Kernel support for MISC binaries' CONFIG_BINFMT_MISC
 
