@@ -13,48 +13,48 @@ SECTIONS
     *(.rodata)
     *(.rodata1)
     /* .gnu.warning sections are handled specially by elf32.em.  */
-    *(.gnu.war)
+    *(.gnu.warning)
   } =0
   .kstrtab : { *(.kstrtab) }
 
   . = ALIGN(16);		/* Exception table */
   __start___ex_table = .;
-  __ex_table : { *(__ex_tab) }
+  __ex_table : { *(__ex_table) }
   __stop___ex_table = .;
 
   __start___dbe_table = .;	/* Exception table for data bus errors */
-  __dbe_table : { *(__dbe_tab) }
+  __dbe_table : { *(__dbe_table) }
   __stop___dbe_table = .;
 
   __start___ksymtab = .;	/* Kernel symbol table */
-  __ksymtab : { *(__ksymta) }
+  __ksymtab : { *(__ksymtab) }
   __stop___ksymtab = .;
 
   _etext = .;
 
   . = ALIGN(8192);
-  .itask : { *(.itask) }
+  .data.init_task : { *(.data.init_task) }
 
   /* Startup code */
   . = ALIGN(4096);
   __init_begin = .;
-  .text.init : { *(.text.in) }
-  .data.init : { *(.data.in) }
+  .text.init : { *(.text.init) }
+  .data.init : { *(.data.init) }
   . = ALIGN(16);
   __setup_start = .;
-  .setup.init : { *(.setup.i) }
+  .setup.init : { *(.setup.init) }
   __setup_end = .;
   __initcall_start = .;
-  .initcall.init : { *(.initcal) }
+  .initcall.init : { *(.initcall.init) }
   __initcall_end = .;
   . = ALIGN(4096);	/* Align double page for init_task_union */
   __init_end = .;
 
   . = ALIGN(4096);
-  .data.page_aligned : { *(.data.id) }
+  .data.page_aligned : { *(.data.idt) }
 
   . = ALIGN(32);
-  .data.cacheline_aligned : { *(.data.ca) }
+  .data.cacheline_aligned : { *(.data.cacheline_aligned) }
 
   .fini      : { *(.fini)    } =0
   .reginfo : { *(.reginfo) }
@@ -110,9 +110,9 @@ SECTIONS
   /* Sections to be discarded */
   /DISCARD/ :
   {
-        *(.text.ex)
-        *(.data.ex)
-        *(.exitcal)
+        *(.text.exit)
+        *(.data.exit)
+        *(.exitcall.exit)
   }
 
   /* These are needed for ELF backends which have not yet been
