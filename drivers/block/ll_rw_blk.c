@@ -1274,6 +1274,9 @@ int __init blk_dev_init(void)
 #ifdef CONFIG_PSX_MEM_CARD
 	bu_init();
 #endif
+#ifdef CONFIG_PSX_CDROM
+	psxcd_init();
+#endif
 	return 0;
 };
 
