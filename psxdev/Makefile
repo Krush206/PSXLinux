@@ -15,15 +15,13 @@ LDFLAGS  = -Wl,-T,psxdev.ld -e _start
 
 E2E      = /opt/PSXLinux/arch/mipsnommu/boot/elf2ecoff
 
-all: demo.bflt gfxdemo.bflt
+TARGETS  = demo.bflt gfxdemo.bflt cargame.bflt
 
-demo.bflt: demo.c psxsys.h psxdev.h psxdev.ld
-	$(CC) $(CFLAGS) $(INC) $(LDFLAGS) -o demo.elf demo.c
-	$(E2E) demo.elf $@
+all: $(TARGETS)
 
-gfxdemo.bflt: gfxdemo.c psxsys.h psxdev.h psxdev.ld
-	$(CC) $(CFLAGS) $(INC) $(LDFLAGS) -o gfxdemo.elf gfxdemo.c
-	$(E2E) gfxdemo.elf $@
+%.bflt: %.c psxsys.h psxdev.h psxdev.ld
+	$(CC) $(CFLAGS) $(INC) $(LDFLAGS) -o $*.elf $<
+	$(E2E) $*.elf $@
 
 clean:
-	rm -f *.elf *.bflt *.o *.a demo gfxdemo
+	rm -f *.elf *.bflt *.o *.a demo gfxdemo cargame
