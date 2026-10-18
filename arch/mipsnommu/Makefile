@@ -16,11 +16,11 @@
 # Select the object file format to substitute into the linker script.
 #
 ifdef CONFIG_CPU_LITTLE_ENDIAN
-tool-prefix	= mipsel-ecoff-
-output-format	= ecoff-littlemips
+tool-prefix	= mipsel-linux-
+output-format	= elf32-littlemips
 else
 tool-prefix	= mips-linux-
-output-format	= ecoff-bigmips
+output-format	= elf32-bigmips
 endif
 
 ifdef CONFIG_CROSSCOMPILE
@@ -37,7 +37,7 @@ endif
 # machines may also.  Since BFD is incredibly buggy with respect to
 # crossformat linking we rely on the elf2ecoff tool for format conversion.
 #
-GCCFLAGS	:= -G 0 -mno-abicalls -fno-pic -mgas
+GCCFLAGS	:= -G 0 -mno-abicalls -fno-pic
 LINKFLAGS	+= -static -G 0
 MODFLAGS	+= -mlong-calls
 
@@ -93,7 +93,7 @@ endif
 #
 GCCFLAGS	+= -pipe
 
-CFLAGS		:= -D__linux__ -I $(TOPDIR)/include/asm/gcc $(CFLAGS) $(GCCFLAGS)
+CFLAGS		:= -I $(TOPDIR)/include/asm/gcc $(CFLAGS) $(GCCFLAGS)
 AFLAGS		+= $(GCCFLAGS)
 
 #
@@ -139,7 +139,10 @@ LIBS := arch/mipsnommu/lib/lib.a $(LIBS)
 
 MAKEBOOT = $(MAKE) -C arch/$(ARCH)/boot
 
-vmlinux.ecoff: vmlinux
+# Under CONFIG_UCLINUX the kernel image is named "linux" ($(LINUX)),
+# but the boot tools expect $(TOPDIR)/vmlinux, so materialize a copy.
+vmlinux.ecoff: $(LINUX)
+	cp -f $(LINUX) vmlinux
 	@$(MAKEBOOT) $@
 
 zImage: vmlinux
