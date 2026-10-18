@@ -14,7 +14,7 @@
  *  0. You just DO WHAT THE FUCK YOU WANT TO.
  */
 
-#include "cdrom.h"
+#include <asm/ps/cdrom.h>
 #include <asm/ps/hwregs.h>
 #include <linux/types.h>
 
