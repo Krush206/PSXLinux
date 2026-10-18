@@ -22,6 +22,7 @@
 #include <linux/fs.h>
 #include <linux/hdreg.h>
 #include <linux/blkpg.h>
+#include <linux/string.h>
 
 #include <asm/io.h>
 #include <asm/delay.h>
@@ -67,7 +68,7 @@ static void lba_to_msf(unsigned long lba, uint8_t *m, uint8_t *s, uint8_t *f)
 /* ---- Public interface ------------------------------------------------- */
 
 int psxcd_drive_init(void) {
-    cd_command(CD_CMD_INIT, NULL);
+    cd_command(CD_CMD_INIT, NULL, 0);
     if (cd_wait_int() == 0)
         return 0;
     return 1;
@@ -76,7 +77,7 @@ int psxcd_drive_init(void) {
 int psxcd_drive_reset(void) {
     unsigned int i;
 
-    cd_command(CD_CMD_RESET, NULL);
+    cd_command(CD_CMD_RESET, NULL, 0);
     if (cd_wait_int() == 0)
         return 0;
 
@@ -89,31 +90,61 @@ int psxcd_drive_reset(void) {
 /* Synchronously read a single 2048 byte sector from the CD-ROM. */
 static int psxcd_read_sector(unsigned long lba, char *buf) {
     uint8_t msf[3];
+    uint8_t s1, s2, s3;
     int i;
 
     lba_to_msf(lba, &msf[0], &msf[1], &msf[2]);
 
-    cd_command(CD_CMD_SETLOC, msf);
-    if (cd_wait_int() == 0)
+    printk(KERN_ERR "psxcd: read lba=%ld msf=%02x:%02x:%02x\n",
+           lba, msf[0], msf[1], msf[2]);
+    cd_command(CD_CMD_SETLOC, msf, 3);
+    printk(KERN_ERR "psxcd: SETLOC sent, waiting...\n");
+    s1 = cd_wait_int();
+    printk(KERN_ERR "psxcd: SETLOC int=%d\n", s1);
+    if (s1 == 0) {
         return 1;
-
-    cd_command(CD_CMD_SEEKL, NULL);
-    if (cd_wait_int() == 0)
-        return 1;
+    }
 
     /* Start streaming */
-    cd_command(CD_CMD_READN, NULL);
-
-    /* Wait for the data-ready interrupt */
-    if (cd_wait_int() == 0)
+    cd_command(CD_CMD_READN, NULL, 0);
+    printk(KERN_ERR "psxcd: READN sent, waiting ack...\n");
+    s2 = cd_wait_int();
+    printk(KERN_ERR "psxcd: READN ack=%d\n", s2);
+    if (s2 == 0) {
         return 1;
+    }
 
-    /* Pull 2048 bytes out of the data FIFO */
+    /* Second interrupt: DataReady — data available in transfer buffer */
+    printk(KERN_ERR "psxcd: waiting data...\n");
+    s3 = cd_wait_int();
+    printk(KERN_ERR "psxcd: READN data=%d\n", s3);
+    if (s3 == 0) {
+        return 1;
+    }
+
+    /* Switch to page 0 so that reg 3 write is treated as "transfer
+     * start" (case 0), not "ack Stat" (case 1) */
+    cd_set_page(0);
+    CD_REGS[3] = 0x80;
+    /* Skip the sector sync + header to reach the 2048-byte user data.
+     * pTransfer starts at Transfer+12 (the fake header created by
+     * cdriso's cdread_2048); the actual user data is at Transfer+24,
+     * so skip 12 bytes. */
+    for (i = 0; i < 12; i++)
+        (void) CD_REGS[2];
     for (i = 0; i < PSXCD_HARDSECSIZE; i++)
-        buf[i] = CD_REGS[1];
+        buf[i] = CD_REGS[2];
+
+    /* Debug: dump first 16 bytes of first few sectors */
+    if (lba <= 18) {
+        printk(KERN_ERR "psxcd: lba=%ld data:", lba);
+        for (i = 0; i < 16; i++)
+            printk("%02x ", (unsigned char)buf[i]);
+        printk("\n");
+    }
 
     /* Stop the drive */
-    cd_command(CD_CMD_GETSTAT, NULL);
+    cd_command(CD_CMD_GETSTAT, NULL, 0);
     (void) cd_read_reply(NULL);
 
     return 0;
@@ -136,12 +167,24 @@ static void do_psxcd_request (request_queue_t * q) {
             continue;
         }
 
-        for (i = 0; i < nsect; i++) {
-            if (psxcd_read_sector(start + i,
-                    (char *) CURRENT->buffer + (i << SECTOR_SZ_SHIFT)))
-                break;
+        /* Convert 512-byte block layer sectors to 2048-byte CD sectors */
+        for (i = 0; i < nsect; i += 4) {
+            unsigned long cd_lba = (start + i) >> 2; /* 512→2048 sector */
+            char *dst = (char *) CURRENT->buffer + (i << 9);
+            unsigned long tocopy = (nsect - i) << 9;
+            static char tmp[2048];
+
+            if (tocopy > 2048)
+                tocopy = 2048;
+
+            if (psxcd_read_sector(cd_lba, tmp)) {
+                end_request (FALSE);
+                goto next;
+            }
+            memcpy(dst, tmp, tocopy);
         }
-        end_request(i >= nsect);
+        end_request (TRUE);
+    next: ;
     }
 }
 
@@ -201,6 +244,9 @@ int __init psxcd_init (void) {
         unregister_blkdev (MAJOR_NR, DEVICE_NAME);
         return -EIO;
     }
+    /* Device size in 1K blocks; 0 = unknown size = read may be rejected */
+    psxcd_sizes[0] = 350000;  /* ~350MB, typical CD capacity */
+    blk_size[MAJOR_NR] = psxcd_sizes;
 
     printk (KERN_INFO DEVICE_NAME ": PSX CD-ROM block driver, major %d\n",
             MAJOR_NR);
