@@ -24,6 +24,9 @@
 #ifdef CONFIG_DEVPTS_FS
 extern int init_devpts_fs(void);
 #endif
+#ifdef CONFIG_ISO9660_FS
+extern int init_iso9660_fs(void);
+#endif
 
 void __init filesystem_setup(void)
 {
@@ -35,6 +38,10 @@ void __init filesystem_setup(void)
 
 #ifdef CONFIG_DEVPTS_FS
 	init_devpts_fs();
+#endif
+
+#ifdef CONFIG_ISO9660_FS
+	init_iso9660_fs();
 #endif
 }
 
