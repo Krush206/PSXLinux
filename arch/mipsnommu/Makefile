@@ -16,11 +16,11 @@
 # Select the object file format to substitute into the linker script.
 #
 ifdef CONFIG_CPU_LITTLE_ENDIAN
-tool-prefix	= mipsel-linux-
-output-format	= elf32-littlemips
+tool-prefix	= mipsel-ecoff-
+output-format	= ecoff-littlemips
 else
 tool-prefix	= mips-linux-
-output-format	= elf32-bigmips
+output-format	= ecoff-bigmips
 endif
 
 ifdef CONFIG_CROSSCOMPILE
@@ -37,7 +37,7 @@ endif
 # machines may also.  Since BFD is incredibly buggy with respect to
 # crossformat linking we rely on the elf2ecoff tool for format conversion.
 #
-GCCFLAGS	:= -G 0 -mno-abicalls -fno-pic
+GCCFLAGS	:= -G 0 -mno-abicalls -fno-pic -mgas
 LINKFLAGS	+= -static -G 0
 MODFLAGS	+= -mlong-calls
 
@@ -93,7 +93,7 @@ endif
 #
 GCCFLAGS	+= -pipe
 
-CFLAGS		:= -I $(TOPDIR)/include/asm/gcc $(CFLAGS) $(GCCFLAGS)
+CFLAGS		:= -D__linux__ -I $(TOPDIR)/include/asm/gcc $(CFLAGS) $(GCCFLAGS)
 AFLAGS		+= $(GCCFLAGS)
 
 #
