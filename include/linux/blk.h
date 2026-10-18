@@ -49,6 +49,7 @@ extern int ps2esdi_init(void);
 extern int jsfd_init(void);
 extern int blkmem_init(void);
 extern int bu_init (void);
+extern int psxcd_init (void);
 
 #if defined(CONFIG_ARCH_S390)
 extern int mdisk_init(void);
@@ -326,6 +327,13 @@ static void floppy_off(unsigned int nr);
 #define TIMEOUT_VALUE (25*HZ)
 #define DEVICE_REQUEST do_ida_request0
 #define DEVICE_NR(device) (MINOR(device) >> 4)
+
+#elif (MAJOR_NR == PSXCD_MAJOR)
+
+/* PSX CD-ROM */
+#define DEVICE_NAME "PSX CD-ROM"
+#define DEVICE_REQUEST do_psxcd_request
+#define DEVICE_NR(device) (MINOR(device))
 
 #elif (MAJOR_NR == BU_MAJOR)
 
