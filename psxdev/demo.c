@@ -16,7 +16,31 @@ void __main(void) { }
 __attribute__((section(".text.start")))
 void _start(void)
 {
-	sint ret = main();
+	sint ret;
+
+	/* Direct SIO write to prove we're running (bypasses syscalls) */
+	{
+		volatile unsigned short *stat = (volatile unsigned short *)0x1F801054;
+		volatile unsigned char *data = (volatile unsigned char *)0x1F801050;
+		int i;
+		for (i = 0; i < 1000; i++) {
+			if (*stat & 0x0001)
+				break;
+		}
+		*data = 'D';
+		for (i = 0; i < 1000; i++) {
+			if (*stat & 0x0001)
+				break;
+		}
+		*data = '!';
+		for (i = 0; i < 1000; i++) {
+			if (*stat & 0x0001)
+				break;
+		}
+		*data = '\n';
+	}
+
+	ret = main();
 	sys_exit(ret);
 	for (;;) ;  /* unreachable */
 }
