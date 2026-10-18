@@ -740,6 +740,7 @@ static void __init do_basic_setup(void)
 	init_pcmcia_ds();		/* Do this last */
 #endif
 
+#ifndef CONFIG_PLAYSTATION
 	/* Mount the root filesystem.. */
 	mount_root();
 
@@ -762,6 +763,13 @@ static void __init do_basic_setup(void)
 				printk(KERN_ERR "Change root to /initrd: "
 				    "error %d\n",error);
 		}
+	}
+#endif
+#else
+	{
+		int fd;
+
+		printk("%d\n", fd = FileOpen("cdrom:SYSTEM.CNF", O_RDWR));
 	}
 #endif
 }
