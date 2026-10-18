@@ -110,6 +110,7 @@ obj-$(CONFIG_SERIAL_SA1100) += serial_sa1100.o
 obj-$(CONFIG_SERIAL_AMBA) += serial_amba.o
 obj-$(CONFIG_SERIAL_PSX) += serial_psx.o
 obj-$(CONFIG_SERIAL_PSX_CONSOLE) += ../../arch/mipsnommu/ps/siocon.o
+obj-$(CONFIG_PSX_SPU) += psxspu.o
 
 ifndef CONFIG_SUN_KEYBOARD
   obj-$(CONFIG_VT) += keyboard.o $(KEYMAP) $(KEYBD)
