@@ -68,9 +68,7 @@ static void lba_to_msf(unsigned long lba, uint8_t *m, uint8_t *s, uint8_t *f)
 
 int psxcd_drive_init(void) {
     cd_command(CD_CMD_INIT, NULL);
-    if (cd_wait_int() != 3)
-        return 0;
-    if (cd_wait_int() != 2)
+    if (cd_wait_int() == 0)
         return 0;
     return 1;
 }
@@ -79,7 +77,7 @@ int psxcd_drive_reset(void) {
     unsigned int i;
 
     cd_command(CD_CMD_RESET, NULL);
-    if (cd_wait_int() != 3)
+    if (cd_wait_int() == 0)
         return 0;
 
     for (i = 0; i < 0x400000; i++)
@@ -96,18 +94,18 @@ static int psxcd_read_sector(unsigned long lba, char *buf) {
     lba_to_msf(lba, &msf[0], &msf[1], &msf[2]);
 
     cd_command(CD_CMD_SETLOC, msf);
-    if (cd_wait_int() != 3)
+    if (cd_wait_int() == 0)
         return 1;
 
     cd_command(CD_CMD_SEEKL, NULL);
-    if (cd_wait_int() != 2)
+    if (cd_wait_int() == 0)
         return 1;
 
     /* Start streaming */
     cd_command(CD_CMD_READN, NULL);
 
     /* Wait for the data-ready interrupt */
-    if (cd_wait_int() != 1)
+    if (cd_wait_int() == 0)
         return 1;
 
     /* Pull 2048 bytes out of the data FIFO */
