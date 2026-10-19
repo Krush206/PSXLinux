@@ -536,23 +536,23 @@ asmlinkage void __init start_kernel(void)
 	lock_kernel();
 	printk(linux_banner);
 	setup_arch(&command_line);
+	early_putc('8');
 	printk("Kernel command line: %s\n", saved_command_line);
+	early_putc('9');
 	parse_options(command_line);
+	early_putc('%');
 	trap_init();
+	early_putc('*');
 	init_IRQ();
+	early_putc('(');
 	sched_init();
+	early_putc(')');
 	time_init();
+	early_putc('-');
 	softirq_init();
-
-	/*
-	 * HACK ALERT! This is early. We're enabling the console before
-	 * we've done PCI setups etc, and console_init() must be aware of
-	 * this. But we do want output early, in case something goes wrong.
-	 */
+	early_putc('_');
 	console_init();
-#ifdef CONFIG_MODULES
-	init_modules();
-#endif
+	early_putc('+');
 	if (prof_shift) {
 		unsigned int size;
 		/* only text is profiled */
