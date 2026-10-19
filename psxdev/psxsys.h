@@ -37,6 +37,8 @@ typedef signed short	int16_t;
 #define SYS_chmod		15
 #define SYS_lseek		19
 #define SYS_getpid		20
+#define SYS_stat		25
+#define SYS_fstat		35
 #define SYS_mount		21
 #define SYS_ioctl		54
 #define SYS_fcntl		55
@@ -107,6 +109,11 @@ static inline sint sys_write(sint fd, const void *buf, sint count)
 static inline sint sys_ioctl(sint fd, sint cmd, sint arg)
 {
 	return sys_call3(SYS_ioctl, fd, cmd, arg);
+}
+
+static inline sint sys_fstat(sint fd, void *buf)
+{
+	return sys_call3(SYS_fstat, fd, (sint)buf, 0);
 }
 
 static inline void sys_exit(sint code)
