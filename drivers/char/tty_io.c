@@ -2149,11 +2149,15 @@ int tty_unregister_driver(struct tty_driver *driver)
  * Just do some early initializations, and do the complex setup
  * later.
  */
+extern void early_putc(char c);
+
 void __init console_init(void)
 {
+	early_putc('c');
 	/* Setup the default TTY line discipline. */
 	memset(ldiscs, 0, sizeof(ldiscs));
 	(void) tty_register_ldisc(N_TTY, &tty_ldisc_N_TTY);
+	early_putc('d');
 
 	/*
 	 * Set up the standard termios.  Individual tty drivers may 
@@ -2173,6 +2177,7 @@ void __init console_init(void)
 	 */
 #ifdef CONFIG_VT
 	con_init();
+	early_putc('e');
 #endif
 #ifdef CONFIG_SERIAL_CONSOLE
 #if (defined(CONFIG_8xx) || defined(CONFIG_8260))
