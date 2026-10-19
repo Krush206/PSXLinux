@@ -213,15 +213,20 @@ def convert(path):
     crect = None
     if pmode < 2:
         crect = tuple(meta.get("crect", (0, 480, 16, 1)))
-        # prefer the original CLUT so round trips are exact
-        try:
-            clut = load_clut_from_tim(tim_path)
-        except (IOError, struct.error):
-            n = 16 if pmode == 0 else 256
-            if len(clut) < n:
-                raise SystemExit(
-                    "no CLUT available: keep the original %s next to the "
-                    "PNG or extend the sidecar with one" % tim_path)
+        # prefer the CLUT embedded in the sidecar (fully open pipeline);
+        # fall back to reading the original TIM if absent
+        clut = meta.get("clut", [])
+        if not clut:
+            try:
+                clut = load_clut_from_tim(tim_path)
+            except (IOError, struct.error):
+                pass
+        n = 16 if pmode == 0 else 256
+        if len(clut) < n:
+            raise SystemExit(
+                "no CLUT available: keep the %s next to the PNG or "
+                "re-extract with tim2png.py (newer versions embed the "
+                "CLUT in the sidecar)" % tim_path)
 
     data = build_tim(pmode, prect, rows, clut, crect)
     with open(tim_path, "wb") as f:
