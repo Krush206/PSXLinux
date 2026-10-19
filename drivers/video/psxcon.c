@@ -51,6 +51,8 @@ static int psxvga_bottom;
  *  Interface used by the world
  */
 
+extern void early_putc(char c);
+
 static const char *psxvga_startup(void);
 static void psxvga_init(struct vc_data *conp, int init);
 static void psxvga_deinit(struct vc_data *conp);
@@ -81,6 +83,7 @@ static const char *psxvga_startup (void)
    const char *display_desc = "PSXGPU console";
    int  x, y;
    unsigned long mode;
+   early_putc('N');
    for (y = 0; y < PSXVGA_VSCR_H; y++)
       for (x = 0; x < PSXVGA_VSCR_W; x++)
          psxvga_scrbuf[y][x] = 0;
@@ -93,8 +96,11 @@ static const char *psxvga_startup (void)
     mode=0x800000b;
 #endif    
      InitGPU (mode);
+   early_putc('O');
    cls ();
+   early_putc('P');
    LoadFont ();
+   early_putc('Q');
     psxvga_bottom = 0;
 
    return  display_desc;
