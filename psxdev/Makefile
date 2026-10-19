@@ -1,4 +1,4 @@
-# psxdev/Makefile - build the PSXLinux userspace game library and demos.
+# psxdev/Makefile - build the PSXLinux userspace game demos.
 #
 # The demos use raw syscalls (no libc); the kernel provides
 # /dev/psxgpu (major 210) and /dev/psxspu (major 211).
@@ -19,9 +19,17 @@ TARGETS  = demo.bflt gfxdemo.bflt cargame.bflt
 
 all: $(TARGETS)
 
-%.bflt: %.c psxsys.h psxdev.h psxdev.ld
-	$(CC) $(CFLAGS) $(INC) $(LDFLAGS) -o $*.elf $<
-	$(E2E) $*.elf $@
+demo.bflt: demo.c
+	$(CC) $(CFLAGS) $(INC) $(LDFLAGS) -o demo.elf demo.c
+	$(E2E) demo.elf demo.bflt
+
+gfxdemo.bflt: gfxdemo.c psxsys.h psxdev.h psxdev.ld
+	$(CC) $(CFLAGS) $(INC) $(LDFLAGS) -o gfxdemo.elf gfxdemo.c
+	$(E2E) gfxdemo.elf gfxdemo.bflt
+
+cargame.bflt: cargame.c psxsys.h psxdev.h psxdev.ld
+	$(CC) $(CFLAGS) $(INC) $(LDFLAGS) -o cargame.elf cargame.c
+	$(E2E) cargame.elf cargame.bflt
 
 clean:
 	rm -f *.elf *.bflt *.o *.a demo gfxdemo cargame
