@@ -73,18 +73,23 @@ typedef struct {
 
 /*
  * ---- GPU sprite ----
+ *
+ * Layout matches the Sony libps definition (libps.h) so that the
+ * attribute bits (and the fixed-point handles) keep their full width.
+ * x,y are screen coordinates measured from the centre of the screen,
+ * as is everything else in the 2D API.
  */
 typedef struct {
-	long x, y;			/* screen position */
-	long w, h;			/* width/height in pixels */
+	u_long attribute;		/* flags (bit28/30/31, ABE, ...) */
+	short  x, y;			/* screen position (centre origin) */
+	u_short w, h;			/* width/height in pixels */
 	u_short tpage;			/* texture page attribute */
-	u_short attribute;		/* semi-transparency, CLUT mode */
 	u_char u, v;			/* texture offset within page */
-	long cx, cy;			/* CLUT position in VRAM */
-	long r, g, b;			/* color modulation */
-	long mx, my;			/* rotation/scale center */
-	long scalex, scaley;		/* fixed-point scale */
-	long rotate;			/* rotation angle */
+	short  cx, cy;			/* CLUT position in VRAM */
+	u_char r, g, b;			/* colour modulation (0x80 = 1.0) */
+	short  mx, my;			/* rotation/scale centre */
+	short  scalex, scaley;		/* fixed-point scale (ONE = 1.0) */
+	long   rotate;			/* rotation angle */
 } GsSPRITE;
 
 /*
@@ -111,20 +116,26 @@ typedef struct {
 /*
  * ---- Ordering table ----
  *
- * In the real Gs library, the OT is a linked list of GPU packets
- * sorted by depth.  Our implementation uses immediate-mode rendering
- * (each GsSort* call draws immediately), so the OT is simplified.
+ * The OT is an array of buckets, one per depth slice.  Each bucket holds
+ * a singly-linked list of GPU packets; GsDrawOt() walks the buckets from
+ * far to near, so a lower index is closer to the viewer.  The game sizes
+ * the array as (1 << length) and passes a priority for 2D primitives or
+ * a depth shift for polygons.
  */
 typedef u_long GsOT_TAG;
 
 typedef struct {
-	long length;			/* OT depth */
-	GsOT_TAG *org;			/* OT array pointer */
+	long length;			/* log2 of the number of buckets */
+	GsOT_TAG *org;			/* bucket array */
 } GsOT;
 
-/* Packet area (unused in immediate mode, kept for compatibility) */
+/*
+ * Packet descriptor.  GsSetWorkBase() is handed the game's array, but
+ * the real packet arena is private to this library; the type only has to
+ * be a word-aligned block for the cast in the game's RenderPrepare().
+ */
 typedef struct {
-	u_long data[16];		/* enough for a 4-point gouraud poly */
+	u_long data[16];
 } PACKET;
 
 /*
@@ -197,18 +208,34 @@ typedef struct {
 	u_long *clut;			/* pointer to CLUT data */
 	long cw, ch;			/* CLUT dimensions */
 	long cx, cy;			/* CLUT VRAM position */
+	u_long pixlen;			/* pixel data length in bytes */
+	u_long clutlen;			/* CLUT data length in bytes */
 } GsIMAGE;
 
 /*
  * ---- TMD structures ----
+ *
+ * These mirror the real TMD / GPU packet layout (see psx-spx
+ * "TMD File Format").  The first byte of every packet is its total
+ * length in 32-bit words (olen), the second is the number of data
+ * words (ilen), and byte 3 is the GPU command that the packet maps
+ * onto.  Packs are stored in VRAM-order so a parsed packet needs
+ * only its vertex coordinates patched before being sent.
+ *
+ * Field names match the game's own tmd.h so the dynamic TMD builder
+ * (libs/tmd.c) compiles unchanged against this header.
  */
 #ifndef _TMD_TYPES_DEFINED
 #define _TMD_TYPES_DEFINED
 
-typedef struct { long vx, vy, vz; } VERTEX;
-typedef struct { long nx, ny, nz; } NORMAL;
-typedef struct { long r, g, b; } COLOUR;
-typedef struct { long x0,y0,x1,y1,x2,y2,x3,y3; long cq,cx,cy; } TEXTURE;
+typedef struct { short vx, vy, vz, pad; } VERTEX;
+typedef struct { short nx, ny, nz, pad; } NORMAL;
+typedef struct { u_char r, g, b; } COLOUR;
+typedef struct {
+	u_short x0, y0, x1, y1, x2, y2, x3, y3;
+	int     cq;
+	u_short cx, cy;
+} TEXTURE;
 typedef struct { u_long id; u_long flag; u_long nobj; } HEADER;
 typedef struct {
 	u_long vert_top; u_long n_vert;
@@ -217,67 +244,78 @@ typedef struct {
 	long scale;
 } OBJECT;
 
+/* F3 flat / gouraud - 4 / 6 words */
 typedef struct {
-	u_long mode; u_long flag; u_long ilen; u_long olen;
-	u_long mode2;
-	u_short vert0, vert1, vert2;
-	u_char r0,g0,b0,code0;
+	u_char olen, ilen, flag, mode;
+	u_char r0, g0, b0, mode2;
+	u_short vert0, vert1;
+	u_short vert2, pad;
 } FACE_3_NS_FP;
 
 typedef struct {
-	u_long mode; u_long flag; u_long ilen; u_long olen;
-	u_long mode2;
-	u_short vert0, vert1, vert2;
-	u_char r0,g0,b0,code0;
-	u_char r1,g1,b1,code1;
-	u_char r2,g2,b2,code2;
+	u_char olen, ilen, flag, mode;
+	u_char r0, g0, b0, mode2;
+	u_char r1, g1, b1, pad1;
+	u_char r2, g2, b2, pad2;
+	u_short vert0, vert1;
+	u_short vert2, pad3;
 } FACE_3_NS_GP;
 
+/* F4 flat / gouraud - 5 / 8 words (one trailing pad word) */
 typedef struct {
-	u_long mode; u_long flag; u_long ilen; u_long olen;
-	u_long mode2;
-	u_short vert0, vert1, vert2, vert3;
-	u_char r0,g0,b0,code0;
+	u_char olen, ilen, flag, mode;
+	u_char r0, g0, b0, mode2;
+	u_short vert0, vert1;
+	u_short vert2, vert3;
+	u_long pad;
 } FACE_4_NS_FP;
 
 typedef struct {
-	u_long mode; u_long flag; u_long ilen; u_long olen;
-	u_long mode2;
-	u_short vert0, vert1, vert2, vert3;
-	u_char r0,g0,b0,code0;
-	u_char r1,g1,b1,code1;
-	u_char r2,g2,b2,code2;
-	u_char r3,g3,b3,code3;
+	u_char olen, ilen, flag, mode;
+	u_char r0, g0, b0, mode2;
+	u_char r1, g1, b1, pad0;
+	u_char r2, g2, b2, pad1;
+	u_char r3, g3, b3, pad2;
+	u_short vert0, vert1;
+	u_short vert2, vert3;
+	u_long pad;
 } FACE_4_NS_GP;
 
+/* FT4 flat textured - 9 words */
 typedef struct {
-	u_long mode; u_long flag; u_long ilen; u_long olen;
-	u_long mode2;
-	u_short vert0, vert1, vert2, vert3;
-	u_char r0,g0,b0,code0;
+	u_char olen, ilen, flag, mode;
 	u_char u0, v0;
-	u_short tsb;
 	u_short cba;
 	u_char u1, v1;
+	u_short tsb;
 	u_char u2, v2;
+	u_short pad1;
 	u_char u3, v3;
+	u_short pad2;
+	u_char r0, g0, b0, pad3;
+	u_short vert0, vert1;
+	u_short vert2, vert3;
 	u_long pad;
 } FACE_4_TX_NS_FP;
 
+/* GT4 gouraud textured - 12 words */
 typedef struct {
-	u_long mode; u_long flag; u_long ilen; u_long olen;
-	u_long mode2;
-	u_short vert0, vert1, vert2, vert3;
-	u_char r0,g0,b0,code0;
+	u_char olen, ilen, flag, mode;
 	u_char u0, v0;
-	u_short tsb;
 	u_short cba;
 	u_char u1, v1;
-	u_char r1,g1,b1,code1;
+	u_short tsb;
 	u_char u2, v2;
-	u_char r2,g2,b2,code2;
+	u_short pad1;
 	u_char u3, v3;
-	u_char r3,g3,b3,code3;
+	u_short pad2;
+	u_char r0, g0, b0, pad3;
+	u_char r1, g1, b1, pad4;
+	u_char r2, g2, b2, pad5;
+	u_char r3, g3, b3, pad6;
+	u_short vert0, vert1;
+	u_short vert2, vert3;
+	u_long pad;
 } FACE_4_TX_NS_GP;
 
 #endif /* _TMD_TYPES_DEFINED */
@@ -340,6 +378,12 @@ void ApplyMatrixLV(MATRIX *m, VECTOR *in, VECTOR *out);
 void LoadImage(RECT *rect, u_long *data);
 long GetTPage(long mode, long semi, long x, long y);
 void GsGetTimInfo(u_long *tim, GsIMAGE *info);
+
+/* Low-level GPU access (used by psxlib.c) */
+void GsSendGP0(u_long cmd);
+void GsSendGP1(u_long cmd);
+void GsSetDrawArea(long x, long y, long w, long h);
+void GsSetDrawOffset(long x, long y);
 
 /* Font (stubbed — we don't use the Sony font) */
 long FntLoad(long x, long y);
