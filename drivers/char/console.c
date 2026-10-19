@@ -2372,17 +2372,21 @@ static int console_refcount;
 
 DECLARE_TASKLET_DISABLED(console_tasklet, console_softint, 0);
 
+extern void early_putc(char c);
+
 void __init con_init(void)
-{     
+{
 	const char *display_desc = NULL;
 	unsigned int currcons = 0;
+	early_putc('C');
 	if (conswitchp)
 		display_desc = conswitchp->con_startup();
-
+	early_putc('D');
 	if (!display_desc) {
 		fg_console = 0;
 		return;
 	}
+	early_putc('E');
 	memset(&console_driver, 0, sizeof(struct tty_driver));
 	console_driver.magic = TTY_DRIVER_MAGIC;
 	console_driver.name = "vc/%d";
@@ -2419,6 +2423,7 @@ void __init con_init(void)
 
 	if (tty_register_driver(&console_driver))
 		panic("Couldn't register console driver\n");
+	early_putc('F');
 	/*
 	 * kmalloc is not running yet - we use the bootmem allocator.
 	 */
@@ -2430,11 +2435,14 @@ void __init con_init(void)
 				alloc_bootmem(sizeof(struct vt_struct));
 
 		visual_init(currcons, 1);
+		early_putc('G');
 		screenbuf = (unsigned short *) alloc_bootmem(screenbuf_size);
 		kmalloced = 0;
+		early_putc('H');
 		vc_init(currcons, video_num_lines, video_num_columns, 
 			currcons || !sw->con_save_screen);
 	}
+	early_putc('I');
 	init_timer(&console_timer);
 	console_timer.function = blank_screen;
 	if (blankinterval) {
@@ -2444,10 +2452,14 @@ void __init con_init(void)
 	currcons = fg_console = 0;
 	master_display_fg = vc_cons[currcons].d;
 	set_origin(currcons);
+	early_putc('J');
 	save_screen(currcons);
+	early_putc('K');
 	gotoxy(currcons,x,y);
 	csi_J(currcons, 0);
+	early_putc('L');
 	update_screen(fg_console);
+	early_putc('M');
 	printk("Console: %s %s %dx%d",
 		can_do_color ? "colour" : "mono",
 		display_desc, video_num_columns, video_num_lines);
