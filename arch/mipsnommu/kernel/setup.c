@@ -198,9 +198,37 @@ asmlinkage void __init
 init_arch(int argc, char **argv, char **envp, int *prom_vec)
 {
 	unsigned int s;
+	volatile unsigned short *stat = (volatile unsigned short *)0x1f801054;
+	volatile unsigned char *data = (volatile unsigned char *)0x1f801050;
+	int i;
+	const char *msg = "INIT_ARCH: Entry\n";
+
+	/* Early debug via SIO */
+	while (*msg) {
+		for (i = 0; i < 100000; i++)
+			if (*stat & 0x0001)
+				break;
+		*data = (unsigned char)*msg++;
+	}
+
+	msg = "INIT_ARCH: cpu_probe\n";
+	while (*msg) {
+		for (i = 0; i < 100000; i++)
+			if (*stat & 0x0001)
+				break;
+		*data = (unsigned char)*msg++;
+	}
 
 	/* Determine which MIPS variant we are running on. */
 	cpu_probe();
+
+	msg = "INIT_ARCH: prom_init\n";
+	while (*msg) {
+		for (i = 0; i < 100000; i++)
+			if (*stat & 0x0001)
+				break;
+		*data = (unsigned char)*msg++;
+	}
 
 	prom_init(argc, argv, envp, prom_vec);
 
@@ -208,12 +236,28 @@ init_arch(int argc, char **argv, char **envp, int *prom_vec)
 	sgi_sysinit();
 #endif
 
+	msg = "INIT_ARCH: loadmmu\n";
+	while (*msg) {
+		for (i = 0; i < 100000; i++)
+			if (*stat & 0x0001)
+				break;
+		*data = (unsigned char)*msg++;
+	}
+
 	/*
 	 * Determine the mmu/cache attached to this machine,
 	 * then flush the tlb and caches.  On the r4xx0
 	 * variants this also sets CP0_WIRED to zero.
 	 */
 	loadmmu();
+
+	msg = "INIT_ARCH: start_kernel\n";
+	while (*msg) {
+		for (i = 0; i < 100000; i++)
+			if (*stat & 0x0001)
+				break;
+		*data = (unsigned char)*msg++;
+	}
 
 	/* Disable coprocessors and set FPU for 16 FPRs */
 	s = read_32bit_cp0_register(CP0_STATUS);
@@ -344,7 +388,9 @@ static void early_puts(const char *s)
 		early_putc(*s++);
 	early_putc('\r');
 	early_putc('\n');
-}void __init setup_arch(char **cmdline_p)
+}
+
+void __init setup_arch(char **cmdline_p)
 {
 	void atlas_setup(void);
 	void baget_setup(void);
@@ -362,6 +408,8 @@ static void early_puts(const char *s)
 	unsigned long bootmap_size;
 	unsigned long start_pfn, max_pfn;
 	int i;
+
+	early_puts("SETUP_ARCH: Entry");
 
 	/* Save defaults for configuration-dependent routines.  */
 	irq_setup = default_irq_setup;
@@ -454,12 +502,16 @@ static void early_puts(const char *s)
 
 	early_putc('A');
 
+	early_putc('1');
+
 	strncpy(command_line, arcs_cmdline, sizeof command_line);
 	command_line[sizeof command_line - 1] = 0;
 	strcpy(saved_command_line, command_line);
 	*cmdline_p = command_line;
 
 	parse_mem_cmdline();
+
+	early_putc('2');
 
 #define PFN_UP(x)	(((x) + PAGE_SIZE - 1) >> PAGE_SHIFT)
 #define PFN_DOWN(x)	((x) >> PAGE_SHIFT)
@@ -491,6 +543,8 @@ static void early_puts(const char *s)
 	/* Initialize the boot-time allocator.  */
 	bootmap_size = init_bootmem(start_pfn, max_pfn);
 	early_putc('B');
+
+	early_putc('3');
 
 	/*
 	 * Register fully available low RAM pages with the bootmem allocator.
@@ -534,9 +588,13 @@ static void early_puts(const char *s)
 	}
 	early_putc('C');
 
+	early_putc('4');
+
 	/* Reserve the bootmap memory.  */
 	reserve_bootmem(PFN_PHYS(start_pfn), bootmap_size);
 	early_putc('D');
+
+	early_putc('5');
 
 	/*
 	 * Reserve the low memory pool (pages 220-255 = 140KB) for kernel
@@ -548,6 +606,8 @@ static void early_puts(const char *s)
 	 */
 	reserve_bootmem(220 * PAGE_SIZE, 36 * PAGE_SIZE);
 	early_putc('E');
+
+	early_putc('6');
 
 	/*
 	 * Reserve the user-program area (0x00100000..0x001A0000, 640KB)
@@ -582,6 +642,8 @@ static void early_puts(const char *s)
 
 	paging_init();
 	early_putc('F');
+
+	early_putc('7');
 
 	/* Tighten VM watermarks to reserve more free pages for slab */
 	freepages.min = 16;
