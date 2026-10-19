@@ -1,0 +1,6 @@
+# Build artifacts
+*.o
+*.elf
+*.bflt
+*.exe
+libs/main
