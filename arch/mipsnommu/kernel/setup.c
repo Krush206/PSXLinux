@@ -26,6 +26,8 @@
 #include <linux/a.out.h>
 #include <linux/tty.h>
 #include <linux/bootmem.h>
+
+#include <linux/swapctl.h>
 #ifdef CONFIG_BLK_DEV_RAM
 #include <linux/blk.h>
 #endif
@@ -318,7 +320,31 @@ static inline void parse_mem_cmdline(void)
 	}
 }
 
-void __init setup_arch(char **cmdline_p)
+/*
+ * Early serial trace: the PSX BIOS has already programmed the SIO
+ * port, so we can push characters out before console_init() runs.
+ * Used to debug crashes between setup_arch() and console_init(),
+ * where printk output is still only buffered.
+ */
+void early_putc(char c)
+{
+	volatile unsigned short *stat = (volatile unsigned short *)0x1f801054;
+	volatile unsigned char *data = (volatile unsigned char *)0x1f801050;
+	int i;
+
+	for (i = 0; i < 100000; i++)
+		if (*stat & 0x0001)
+			break;
+	*data = (unsigned char)c;
+}
+
+static void early_puts(const char *s)
+{
+	while (*s)
+		early_putc(*s++);
+	early_putc('\r');
+	early_putc('\n');
+}void __init setup_arch(char **cmdline_p)
 {
 	void atlas_setup(void);
 	void baget_setup(void);
@@ -426,6 +452,8 @@ void __init setup_arch(char **cmdline_p)
 		panic("Unsupported architecture");
 	}
 
+	early_putc('A');
+
 	strncpy(command_line, arcs_cmdline, sizeof command_line);
 	command_line[sizeof command_line - 1] = 0;
 	strcpy(saved_command_line, command_line);
@@ -462,6 +490,7 @@ void __init setup_arch(char **cmdline_p)
 
 	/* Initialize the boot-time allocator.  */
 	bootmap_size = init_bootmem(start_pfn, max_pfn);
+	early_putc('B');
 
 	/*
 	 * Register fully available low RAM pages with the bootmem allocator.
@@ -503,9 +532,31 @@ void __init setup_arch(char **cmdline_p)
 		size = last_pfn - curr_pfn;
 		free_bootmem(PFN_PHYS(curr_pfn), PFN_PHYS(size));
 	}
+	early_putc('C');
 
 	/* Reserve the bootmap memory.  */
 	reserve_bootmem(PFN_PHYS(start_pfn), bootmap_size);
+	early_putc('D');
+
+	/*
+	 * Reserve the low memory pool (pages 220-255 = 140KB) for kernel
+	 * slab allocator only.  This prevents the page cache from
+	 * competing with the slab allocator for the same buddy pages,
+	 * which was causing struct file / dentry / inode corruption.
+	 * Must use reserve_bootmem BEFORE free_all_bootmem() so the buddy
+	 * allocator never sees these pages.
+	 */
+	reserve_bootmem(220 * PAGE_SIZE, 36 * PAGE_SIZE);
+	early_putc('E');
+
+	/*
+	 * Reserve the user-program area (0x00100000..0x001A0000, 640KB)
+	 * so the page cache never allocates these pages.  This must be
+	 * done here (before free_all_bootmem) so the buddy allocator
+	 * never puts these pages on its free lists.
+	 */
+	reserve_bootmem(0x00100000, 0x001A0000 - 0x00100000);
+	early_putc('F');
 
 #if 0
 #ifdef CONFIG_BLK_DEV_INITRD
@@ -530,6 +581,13 @@ void __init setup_arch(char **cmdline_p)
 #endif /* 0  */
 
 	paging_init();
+	early_putc('F');
+
+	/* Tighten VM watermarks to reserve more free pages for slab */
+	freepages.min = 16;
+	freepages.low = 24;
+	freepages.high = 32;
+	early_putc('G');
 
 	code_resource.start = virt_to_bus(&_ftext);
 	code_resource.end = virt_to_bus(&_etext) - 1;
@@ -566,6 +624,7 @@ void __init setup_arch(char **cmdline_p)
 		request_resource(res, &code_resource);
 		request_resource(res, &data_resource);
 	}
+	early_putc('G');
 }
 
 void r3081_wait(void) 
