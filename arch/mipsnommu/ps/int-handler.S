@@ -85,9 +85,16 @@
 		EXPORT(ps_intr_unimplemented)
 ps_intr_unimplemented:
 		lw	a1, INT_ACKN_REG
-		nop				# to be sure...
-      and a1, a1, 0x7ff
-		PANIC("Unimplemented cpu interrupt 0x%x !");
+		nop
+		lw	a2, INT_MASK_REG
+		nop
+		and	a1, a2
+		beqz	a1, 1f
+		nop
+		mfc0	a3, CP0_CAUSE
+		PANIC("Unimplemented cpu interrupt stat=0x%x mask=0x%x cause=0x%x");
+1:		j	ret_from_irq
+		nop
 
 
 /*
