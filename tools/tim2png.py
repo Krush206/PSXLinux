@@ -143,6 +143,9 @@ class Tim:
              "tex_h": self.tex_h}
         if self.has_clut:
             m["crect"] = list(self.crect)
+            # embed the CLUT (16-bit RGB555+STP words) so png2tim can
+            # rebuild the TIM without needing the original binary
+            m["clut"] = self.clut
         return m
 
 

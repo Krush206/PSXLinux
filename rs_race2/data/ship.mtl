@@ -1,0 +1,4 @@
+newmtl ship
+Kd 0.8 0.8 0.8
+Ka 0.1 0.1 0.1
+illum 1
