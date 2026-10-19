@@ -58,6 +58,11 @@ addu			a1,a1,6*64		#???PSX test shift font
       li 		a3,64*48/2			# anzahl
       jal 	 mem2vram
 
+# debug: mark after first mem2vram
+			li		t4,0x1f801050
+			li		t5,'1'
+			sb		t5,0(t4)
+
       la 		a0,font+20      # transfer clut data to VRAM
       
 #			lh		v0,(a0)					# transparent or not
@@ -68,6 +73,11 @@ addu			a1,a1,6*64		#???PSX test shift font
       li 		a2,16+(1<<16)		# w = 16, h = 1
       li 		a3,8
       jal 	 mem2vram
+
+# debug: mark after second mem2vram
+			li		t4,0x1f801050
+			li		t5,'2'
+			sb		t5,0(t4)
 
 	lw		ra,(sp)
 	addu	sp,sp,4
