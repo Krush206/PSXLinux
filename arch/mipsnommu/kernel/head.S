@@ -179,6 +179,83 @@ NESTED(kernel_entry, 16, sp)
 	EXPORT(stext)
 	EXPORT(_stext)
 
+	/* Initialize SIO (serial port) for early debug output */
+	li	t0, 0x1f80105a		/* SIO_CTRL_REG */
+	li	t1, 0x50
+	sh	t1, 0(t0)
+	li	t2, 1500
+1:	addiu	t2, t2, -1
+	bnez	t2, 1b
+	nop
+
+	li	t0, 0x1f80105e		/* SIO_RATE_REG */
+	li	t1, 0x12			/* SIO_B11520 = 115200 baud */
+	sh	t1, 0(t0)
+	li	t2, 1500
+1:	addiu	t2, t2, -1
+	bnez	t2, 1b
+	nop
+
+	li	t0, 0x1f801058		/* SIO_MODE_REG */
+	li	t1, 0x004e		/* SIO_BRS16|SIO_CHR8|SIO_SB1 = 0x2|0xc|0x40 = 0x4e */
+	sh	t1, 0(t0)
+	li	t2, 1500
+1:	addiu	t2, t2, -1
+	bnez	t2, 1b
+	nop
+
+	li	t0, 0x1f80105a		/* SIO_CTRL_REG */
+	li	t1, 0x0005		/* SIO_RX|SIO_TX = 0x4|0x1 = 0x5 */
+	sh	t1, 0(t0)
+	li	t2, 15000
+1:	addiu	t2, t2, -1
+	bnez	t2, 1b
+	nop
+
+	/* Early debug via SIO */
+	li	t0, 0x1f801050		/* SIO_DATA_REG */
+	li	t2, 0x1f801054		/* SIO_STAT_REG */
+	li	t1, 'K'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'E'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'R'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'N'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'E'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'L'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, '\r'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, '\n'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+
 	/*
 	 * Stack for kernel and init, current variable
 	 */
@@ -199,6 +276,50 @@ NESTED(kernel_entry, 16, sp)
 	addiu	t0, 4
 	bne	t0, t1, 1b
 	 sw	zero, (t0)
+
+	/* Early debug via SIO */
+	li	t0, 0x1f801050		/* SIO data register */
+	li	t2, 0x1f801054		/* SIO status register */
+	li	t1, 'K'
+1:	lhu	t3, 0(t2)		/* wait for TX ready */
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'E'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'R'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'N'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'E'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, 'L'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, '\r'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
+	li	t1, '\n'
+1:	lhu	t3, 0(t2)
+	andi	t3, t3, 0x0001
+	beqz	t3, 1b
+	sb	t1, 0(t0)
 
 	jal	init_arch
 	 nop
