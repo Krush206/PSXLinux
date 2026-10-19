@@ -1,0 +1,16 @@
+*.o
+*.bflt
+*.elf
+*.exe
+*.exe-fixed
+*.a
+*.iso
+*.eco
+*.exe-fixed
+vmlinux
+linux
+linux.exe
+gltron.eco
+gltron.eco.exe
+gltron.eco.exe-fixed
+*.opt
