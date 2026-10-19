@@ -4,10 +4,17 @@
  * Implements the Gs* rendering pipeline, matrix math, VRAM access,
  * and controller input using direct PSX hardware register access.
  *
- * Rendering strategy: immediate mode. Each GsSort* call sends GP0
- * command packets directly to the GPU rather than building an
- * ordering table for deferred DMA. This is simpler and sufficient
- * for the polygon counts this game produces.
+ * Rendering strategy: deferred, via an ordering table, exactly like
+ * the real library (only without DMA).  Each GsSort* call transforms
+ * its geometry and appends one self-contained GPU packet to the
+ * bucket of the ordering table selected by the object's priority (for
+ * 2D primitives) or by its projected depth (for polygons).  GsDrawOt
+ * then walks the table back-to-front and feeds the packets to the GPU
+ * through GP0.  This is what keeps far geometry behind near geometry
+ * regardless of the order the game happens to submit it in.
+ *
+ * The game's coordinates are screen-centred for 2D and use the PSX
+ * world convention (+X right, +Y down, +Z into the screen) for 3D.
  */
 
 #include "libps_compat.h"
@@ -35,8 +42,22 @@ static long gpu_height = 240;
 static long active_buff = 0;
 static long display_area_x[2] = { 0, 0 };
 static long display_area_y[2] = { 0, 240 };
-static long draw_offset_x = 0;
-static long draw_offset_y = 0;
+
+/*
+ * Deferred-rendering arena.  GsSetWorkBase() rewinds it at the start of
+ * every frame and GsDrawOt() empties it into the GPU.  A single arena is
+ * enough: a frame is completely rendered before the next one begins.
+ *
+ * Each packet node is
+ *	[0] next node in its ordering-table bucket
+ *	[1] number of GPU words
+ *	[2..] the GPU words themselves
+ * so callers only ever see a pointer to the words (node + 2).
+ */
+#define PKT_ARENA_WORDS	16384
+static u_long pkt_arena[PKT_ARENA_WORDS];
+static u_long *pkt_top;
+static long pkt_dropped;
 
 static MATRIX ls_matrix;		/* local-to-screen matrix */
 static MATRIX light_matrix;		/* local-to-world (for lighting) */
@@ -80,6 +101,59 @@ static void gp1_send(unsigned int w)
 }
 
 /*
+ * Point the GPU at one of the two framebuffers: the drawing area is the
+ * buffer's rectangle in VRAM and the drawing offset relocates the
+ * screen-relative coordinates produced by the Gs layer into it.  The
+ * offset is applied by the GPU before clipping, so primitives keep using
+ * plain 0..319 / 0..239 coordinates.
+ */
+static void set_draw_target(long idx)
+{
+	long x = display_area_x[idx];
+	long y = display_area_y[idx];
+
+	gp0_send(0xE3000000 | ((unsigned int)(y & 0x1FF) << 10) |
+		 (unsigned int)(x & 0x3FF));
+	gp0_send(0xE4000000 | ((unsigned int)((y + gpu_height - 1) & 0x1FF) << 10) |
+		 (unsigned int)((x + gpu_width - 1) & 0x3FF));
+	gp0_send(0xE5000000 | ((unsigned int)(y & 0x7FF) << 11) |
+		 (unsigned int)(x & 0x7FF));
+}
+
+/*
+ * ---- Low-level GPU access (exposed for psxlib.c) ----
+ */
+
+void GsSendGP0(u_long cmd)
+{
+	gp0_send((unsigned int)cmd);
+}
+
+void GsSendGP1(u_long cmd)
+{
+	gp1_send((unsigned int)cmd);
+}
+
+void GsSetDrawArea(long x, long y, long w, long h)
+{
+	gp0_send(0xE3000000 | ((unsigned int)(y & 0x1FF) << 10) |
+		 (unsigned int)(x & 0x3FF));
+	gp0_send(0xE4000000 | ((unsigned int)((y + h - 1) & 0x1FF) << 10) |
+		 (unsigned int)((x + w - 1) & 0x3FF));
+}
+
+/*
+ * Hardware drawing offset.  The Gs layer applies the double-buffer
+ * offset in software (see GsSwapDispBuff), so callers normally leave
+ * this at (0,0).
+ */
+void GsSetDrawOffset(long x, long y)
+{
+	gp0_send(0xE5000000 | ((unsigned int)(y & 0x7FF) << 11) |
+		 (unsigned int)(x & 0x7FF));
+}
+
+/*
  * ---- Initialization ----
  */
 
@@ -99,17 +173,22 @@ void GsInitGraph(long width, long height, long gpu, long interlace, long dither)
 	/* Display enable */
 	gp1_send(0x03000000);
 
-	/* NTSC 320x240 15bpp non-interlaced */
-	gp1_send(0x08000000);
+	/*
+	 * 320x240 15bpp non-interlaced.  Bits 0-1 select the horizontal
+	 * resolution (0=256, 1=320) and bits 2-3 the vertical one
+	 * (0=240).  The double buffer below is 240 lines tall, so we
+	 * always use 240 lines regardless of the TV standard.
+	 */
+	gp1_send(0x08000001);
 
-	/* Display area at (0,0) — will be updated by GsDefDispBuff */
+	/* Display area at (0,0) — GsDefDispBuff() refines this. */
 	gp1_send(0x05000000);
 
-	/* Horizontal display range (standard NTSC) */
-	gp1_send(0x0602C0C60);
+	/* Horizontal display range: 2560 units = the full 320 pixels. */
+	gp1_send(0x06C00200);
 
-	/* Vertical display range (standard NTSC) */
-	gp1_send(0x07000010);
+	/* Vertical display range: lines 0x10..0x100 = 240 lines. */
+	gp1_send(0x07000410);
 
 	/* Drawing area covers full screen */
 	gp0_send(0xE3000000);
@@ -135,6 +214,13 @@ void GsDefDispBuff(long x0, long y0, long x1, long y1)
 	display_area_y[0] = y0;
 	display_area_x[1] = x1;
 	display_area_y[1] = y1;
+
+	/*
+	 * A frame is rendered into the buffer that is *not* on screen, so
+	 * the first frame goes into buffer active_buff ^ 1 while buffer
+	 * active_buff stays displayed.
+	 */
+	set_draw_target(active_buff ^ 1);
 }
 
 void GsInit3D(void)
@@ -168,34 +254,68 @@ long GsGetActiveBuff(void)
 
 void GsSwapDispBuff(void)
 {
+	long drawn = active_buff ^ 1;	/* buffer the frame went into */
+
+	/* Show what was just rendered... */
+	gp1_send(0x05000000 |
+		 ((unsigned int)display_area_y[drawn] << 10) |
+		 (unsigned int)display_area_x[drawn]);
+
 	active_buff ^= 1;
 
-	/* Update display area to show the just-drawn buffer */
-	gp1_send(0x05000000 |
-		 ((unsigned int)display_area_y[active_buff ^ 1] << 10) |
-		 (unsigned int)display_area_x[active_buff ^ 1]);
-
-	/* Update drawing offset for the new drawing buffer */
-	draw_offset_x = display_area_x[active_buff];
-	draw_offset_y = display_area_y[active_buff];
+	/* ...and aim the next frame at the other buffer. */
+	set_draw_target(active_buff ^ 1);
 }
 
 void GsClearOt(long offset, long point, GsOT *ot)
 {
-	/* Immediate mode — nothing to clear */
-	(void)offset; (void)point; (void)ot;
+	long n, i;
+
+	(void)offset; (void)point;
+
+	if (!ot || !ot->org)
+		return;
+
+	n = 1L << ot->length;
+	for (i = 0; i < n; i++)
+		ot->org[i] = 0;
 }
 
 void GsDrawOt(GsOT *ot)
 {
-	/* Immediate mode — everything already drawn */
-	(void)ot;
+	long n, i, j;
+
+	if (!ot || !ot->org)
+		return;
+
+	/*
+	 * Walk the table back to front.  Bucket 0 is the front-most one,
+	 * so it is emitted last and therefore ends up on top.
+	 */
+	n = 1L << ot->length;
+	for (i = n - 1; i >= 0; i--) {
+		u_long *p = (u_long *)ot->org[i];
+
+		while (p) {
+			long words = (long)p[1];
+
+			for (j = 0; j < words; j++)
+				gp0_send((unsigned int)p[2 + j]);
+			p = (u_long *)p[0];
+		}
+	}
 }
 
 void GsSetWorkBase(PACKET *base)
 {
-	/* Immediate mode — no packet buffer needed */
+	/*
+	 * The game hands us one of its (small) packet arrays, but the
+	 * arena actually lives here so it can be sized for the whole
+	 * scene rather than for a single primitive.
+	 */
 	(void)base;
+	pkt_top = pkt_arena;
+	pkt_dropped = 0;
 }
 
 /*
@@ -225,75 +345,149 @@ void DrawSync(long mode)
  * ---- 2D drawing ----
  */
 
+/*
+ * Allocate a packet node holding room for `words` GPU words.  Returns a
+ * pointer to the word area, or NULL if the arena is exhausted (in which
+ * case the primitive is simply dropped and counted).
+ */
+static u_long *pkt_new(long words)
+{
+	u_long *p;
+
+	if (!pkt_top)
+		return 0;
+	if (pkt_top + words + 2 > pkt_arena + PKT_ARENA_WORDS) {
+		pkt_dropped++;
+		return 0;
+	}
+
+	p = pkt_top;
+	pkt_top += words + 2;
+	p[0] = 0;
+	p[1] = (u_long)words;
+	return p + 2;
+}
+
+/*
+ * Chain a finished packet into the bucket `priority` of the ordering
+ * table.  Lower numbers are nearer the viewer and are drawn last.
+ */
+static void pkt_link(GsOT *ot, long priority, u_long *words)
+{
+	u_long *node = words - 2;
+	long n;
+
+	if (!ot || !ot->org)
+		return;
+
+	n = 1L << ot->length;
+	if (priority < 0)
+		priority = 0;
+	else if (priority >= n)
+		priority = n - 1;
+
+	node[0] = (u_long)ot->org[priority];
+	ot->org[priority] = (u_long)node;
+}
+
 void GsSortBoxFill(GsBOXF *box, GsOT *ot, long priority)
 {
-	long x = box->x + draw_offset_x;
-	long y = box->y + draw_offset_y;
+	long x = box->x + gpu_width / 2;
+	long y = box->y + gpu_height / 2;
 	long w = box->w;
 	long h = box->h;
-
-	(void)ot; (void)priority;
+	u_long *p;
 
 	if (w <= 0 || h <= 0)
 		return;
 	if (x < -w || x >= gpu_width || y < -h || y >= gpu_height)
 		return;
 
-	gp0_send(0x60000000 |
-		 ((unsigned int)(box->r & 0xFF) << 0) |
-		 ((unsigned int)(box->g & 0xFF) << 8) |
-		 ((unsigned int)(box->b & 0xFF) << 16));
-	gp0_send(((unsigned int)y << 16) | (unsigned int)x);
-	gp0_send(((unsigned int)h << 16) | (unsigned int)w);
+	p = pkt_new(3);
+	if (!p)
+		return;
+
+	p[0] = 0x60000000 |
+	       ((u_long)(box->r & 0xFF) << 0) |
+	       ((u_long)(box->g & 0xFF) << 8) |
+	       ((u_long)(box->b & 0xFF) << 16);
+	p[1] = (((u_long)y & 0xFFFF) << 16) | ((u_long)x & 0xFFFF);
+	p[2] = (((u_long)h & 0xFFFF) << 16) | ((u_long)w & 0xFFFF);
+
+	pkt_link(ot, priority, p);
 }
 
 void GsSortGLine(GsGLINE *line, GsOT *ot, long priority)
 {
-	long x0 = line->x0 + draw_offset_x;
-	long y0 = line->y0 + draw_offset_y;
-	long x1 = line->x1 + draw_offset_x;
-	long y1 = line->y1 + draw_offset_y;
+	long x0 = line->x0 + gpu_width / 2;
+	long y0 = line->y0 + gpu_height / 2;
+	long x1 = line->x1 + gpu_width / 2;
+	long y1 = line->y1 + gpu_height / 2;
+	u_long *p;
 
-	(void)ot; (void)priority;
-
-	if (y0 < 0 || y0 >= gpu_height)
+	p = pkt_new(4);
+	if (!p)
 		return;
 
-	/* GP0 40h: gouraud line, 2 vertices */
-	gp0_send(0x40000000 |
-		 ((unsigned int)(line->r0 & 0xFF) << 0) |
-		 ((unsigned int)(line->g0 & 0xFF) << 8) |
-		 ((unsigned int)(line->b0 & 0xFF) << 16));
-	gp0_send(((unsigned int)y0 << 16) | (unsigned int)x0);
-	gp0_send(((unsigned int)(line->r1 & 0xFF) << 0) |
-		 ((unsigned int)(line->g1 & 0xFF) << 8) |
-		 ((unsigned int)(line->b1 & 0xFF) << 16));
-	gp0_send(((unsigned int)y1 << 16) | (unsigned int)x1);
+	/*
+	 * GP0 40h: two-vertex gouraud line.  The game builds filled
+	 * boxes out of one such line per row, interpolating the colour
+	 * across the row, so both endpoint colours matter.
+	 */
+	p[0] = 0x40000000 |
+	       ((u_long)(line->r0 & 0xFF) << 0) |
+	       ((u_long)(line->g0 & 0xFF) << 8) |
+	       ((u_long)(line->b0 & 0xFF) << 16);
+	p[1] = (((u_long)y0 & 0xFFFF) << 16) | ((u_long)x0 & 0xFFFF);
+	p[2] = ((u_long)(line->r1 & 0xFF) << 0) |
+	       ((u_long)(line->g1 & 0xFF) << 8) |
+	       ((u_long)(line->b1 & 0xFF) << 16);
+	p[3] = (((u_long)y1 & 0xFFFF) << 16) | ((u_long)x1 & 0xFFFF);
+
+	pkt_link(ot, priority, p);
 }
 
 void GsSortSprite(GsSPRITE *spr, GsOT *ot, long priority)
 {
-	long x = spr->x + draw_offset_x;
-	long y = spr->y + draw_offset_y;
+	long x = spr->x + gpu_width / 2;
+	long y = spr->y + gpu_height / 2;
 	long w = spr->w;
 	long h = spr->h;
+	u_long clut, col;
+	u_long *p;
 
-	(void)ot; (void)priority;
+	/*
+	 * scalex/scaley are 12.4 fixed point (ONE == 1.0).  Rotation is
+	 * not supported by the untextured rectangle path.
+	 */
+	if (spr->scalex != ONE && spr->scalex > 0)
+		w = (w * spr->scalex) / ONE;
+	if (spr->scaley != ONE && spr->scaley > 0)
+		h = (h * spr->scaley) / ONE;
 
 	if (w <= 0 || h <= 0)
 		return;
 
-	/*
-	 * For now, render sprites as flat colored rectangles.
-	 * Textured sprite rendering requires VRAM CLUT upload which
-	 * is handled by LoadTIMData in the game's sprite.c.
-	 */
-	gp0_send(0x60000000 |
-		 ((unsigned int)(spr->r & 0xFF) << 0) |
-		 ((unsigned int)(spr->g & 0xFF) << 8) |
-		 ((unsigned int)(spr->b & 0xFF) << 16));
-	gp0_send(((unsigned int)y << 16) | (unsigned int)x);
-	gp0_send(((unsigned int)h << 16) | (unsigned int)w);
+	p = pkt_new(5);
+	if (!p)
+		return;
+
+	/* CLUT word: X in bits 0-5 (in 16-pixel units), Y in bits 6-14. */
+	clut = ((((u_long)spr->cx & 0x3FF) >> 4) & 0x3F) |
+	       ((((u_long)spr->cy) & 0x1FF) << 6);
+	col = ((u_long)(spr->b & 0xFF) << 16) |
+	      ((u_long)(spr->g & 0xFF) << 8) |
+	      ((u_long)(spr->r & 0xFF) << 0);
+
+	/* GP0 E1h selects the texture page for the sprite that follows. */
+	p[0] = 0xE1000000 | ((u_long)spr->tpage & 0x3FF);
+	p[1] = 0x64000000 | col;
+	p[2] = (((u_long)y & 0xFFFF) << 16) | ((u_long)x & 0xFFFF);
+	p[3] = (clut << 16) | ((u_long)(spr->v & 0xFF) << 8) |
+	       (u_long)(spr->u & 0xFF);
+	p[4] = (((u_long)h & 0xFFFF) << 16) | ((u_long)w & 0xFFFF);
+
+	pkt_link(ot, priority, p);
 }
 
 /*
@@ -351,6 +545,22 @@ void GsSetRefView2(GsRVIEW2 *view)
  * ---- Matrix operations ----
  */
 
+/* Integer square root (Newton's method). */
+static long isqrt(long n)
+{
+	long x, y;
+
+	if (n <= 0)
+		return 0;
+	x = n;
+	y = (x + 1) / 2;
+	while (y < x) {
+		x = y;
+		y = (x + n / x) / 2;
+	}
+	return x;
+}
+
 void GsGetLws(GsCOORDINATE2 *coord, MATRIX *lw, MATRIX *ls)
 {
 	MATRIX world;
@@ -398,34 +608,68 @@ void GsGetLws(GsCOORDINATE2 *coord, MATRIX *lw, MATRIX *ls)
 	*lw = world;
 
 	/*
-	 * Compute local-to-screen:
-	 * 1. Subtract the view-from position
-	 * 2. Rotate by inverse view orientation
-	 * 3. Apply perspective projection
-	 *
-	 * Simplified: the game sets the view each frame via GsSetRefView2,
-	 * so we compute the view matrix from the current_view.
+	 * Compose local-to-world with the current view matrix, giving
+	 * local-to-camera (view) space in ls.  ls->m is the combined
+	 * rotation and ls->t the camera-space translation; the perspective
+	 * divide happens later in transform_point().
 	 */
 	{
-		long dx, dy, dz;
-		long scale;
+		MATRIX view;
+		VECTOR fwd, right, up;
+		long fx, fy, fz, len;
+		long eye[3];
+		int k;
 
-		dx = world.t[0] - current_view.vpx;
-		dy = world.t[1] - current_view.vpy;
-		dz = world.t[2] - current_view.vpz;
+		eye[0] = current_view.vpx;
+		eye[1] = current_view.vpy;
+		eye[2] = current_view.vpz;
 
-		/* Simple projection: divide x,y by z, scale by proj dist */
-		scale = projection_distance;
-		if (dz < 1) dz = 1;
+		/* forward = normalise(target - eye) */
+		fx = current_view.vrx - eye[0];
+		fy = current_view.vry - eye[1];
+		fz = current_view.vrz - eye[2];
+		len = isqrt(fx * fx + fy * fy + fz * fz);
+		if (len < 1)
+			len = 1;
+		fwd.vx = (fx << 12) / len;
+		fwd.vy = (fy << 12) / len;
+		fwd.vz = (fz << 12) / len;
 
-		ls->t[0] = dx * scale / dz;
-		ls->t[1] = dy * scale / dz;
-		ls->t[2] = dz;
+		/* right = normalise(worldUp x forward), with up=(0,1,0) */
+		right.vx = fwd.vz;
+		right.vy = 0;
+		right.vz = -fwd.vx;
+		len = isqrt(right.vx * right.vx + right.vz * right.vz);
+		if (len < 1)
+			len = 1;
+		right.vx = (right.vx << 12) / len;
+		right.vz = (right.vz << 12) / len;
 
-		/* Copy the rotation part from local-world */
-		for (i = 0; i < 3; i++)
-			for (j = 0; j < 3; j++)
-				ls->m[i][j] = world.m[i][j];
+		/* up = forward x right */
+		up.vx = (fwd.vy * right.vz - fwd.vz * right.vy) >> 12;
+		up.vy = (fwd.vz * right.vx - fwd.vx * right.vz) >> 12;
+		up.vz = (fwd.vx * right.vy - fwd.vy * right.vx) >> 12;
+
+		view.m[0][0] = right.vx; view.m[0][1] = right.vy; view.m[0][2] = right.vz;
+		view.m[1][0] = up.vx;    view.m[1][1] = up.vy;    view.m[1][2] = up.vz;
+		view.m[2][0] = fwd.vx;   view.m[2][1] = fwd.vy;   view.m[2][2] = fwd.vz;
+		view.t[0] = view.t[1] = view.t[2] = 0;
+
+		/* ls = view * world */
+		for (i = 0; i < 3; i++) {
+			long sum = 0;
+
+			for (j = 0; j < 3; j++) {
+				for (k = 0; k < 3; k++)
+					sum += view.m[i][k] * world.m[k][j];
+				ls->m[i][j] = sum >> 12;
+			}
+
+			sum = 0;
+			for (k = 0; k < 3; k++)
+				sum += view.m[i][k] * (world.t[k] - eye[k]);
+			ls->t[i] = sum >> 12;
+		}
 	}
 }
 
@@ -460,57 +704,121 @@ void GsSetLightMode(long mode)
  * ---- Matrix math ----
  */
 
+/*
+ * ---- Trigonometry ----
+ *
+ * The GTE's angle unit is 1/4096 of a revolution.  We keep a 4096-entry
+ * Q12 sine table (and its cosine) built once, lazily, from a Taylor
+ * series evaluated in soft-float.
+ */
+
+#define TRIG_SIZE	4096
+#define TRIG_PI		3.14159265358979f
+#define TRIG_2PI	6.28318530717959f
+
+static short trig_sin[TRIG_SIZE];
+static short trig_cos[TRIG_SIZE];
+static int trig_ready;
+
+static float taylor_sin(float x)
+{
+	float x2;
+	int neg = 0;
+
+	/* Reduce to [-pi, pi]. */
+	while (x > TRIG_PI)
+		x -= TRIG_2PI;
+	while (x < -TRIG_PI)
+		x += TRIG_2PI;
+
+	/* Reduce to [-pi/2, pi/2]; sin(pi - x) = sin(x). */
+	if (x > TRIG_PI / 2.0f) {
+		x = TRIG_PI - x;
+	} else if (x < -TRIG_PI / 2.0f) {
+		x = -TRIG_PI - x;
+		neg = 1;
+	}
+
+	x2 = x * x;
+	x = x * (1.0f - x2 * (1.0f / 6.0f -
+		x2 * (1.0f / 120.0f -
+		x2 * (1.0f / 5040.0f - x2 / 362880.0f))));
+
+	(void)neg;
+	return x;
+}
+
+static void build_trig(void)
+{
+	int i;
+
+	if (trig_ready)
+		return;
+
+	for (i = 0; i < TRIG_SIZE; i++) {
+		float a = (float)i * TRIG_2PI / (float)TRIG_SIZE;
+		trig_sin[i] = (short)(taylor_sin(a) * 4096.0f + 0.5f);
+		trig_cos[i] = (short)(taylor_sin(a + TRIG_PI / 2.0f) * 4096.0f + 0.5f);
+	}
+	trig_ready = 1;
+}
+
+static long isin(long a)
+{
+	build_trig();
+	return trig_sin[a & (TRIG_SIZE - 1)];
+}
+
+static long icos(long a)
+{
+	build_trig();
+	return trig_cos[a & (TRIG_SIZE - 1)];
+}
+
 void RotMatrix(SVECTOR *vec, MATRIX *m)
 {
 	/*
-	 * Build rotation matrix from Euler angles (fixed point 12.4).
-	 * Standard rotation order: X then Y then Z.
+	 * Build a rotation matrix from Euler angles (GTE convention,
+	 * rotation order X then Y then Z).  Angles are 1/4096 rev.
 	 */
 	long sx, cx, sy, cy, sz, cz;
-	long v;
 
-	/* Simple sine/cosine using linear approximation */
-	/* In real Gs this uses hardware lookup tables */
+	sx = isin(vec->vx); cx = icos(vec->vx);
+	sy = isin(vec->vy); cy = icos(vec->vy);
+	sz = isin(vec->vz); cz = icos(vec->vz);
 
-	v = vec->vx & 0xFFFF;
-	sx = v >> 4;
-	cx = (4096 - (v >> 4) * (v >> 4) / 4096);
-
-	v = vec->vy & 0xFFFF;
-	sy = v >> 4;
-	cy = (4096 - (v >> 4) * (v >> 4) / 4096);
-
-	v = vec->vz & 0xFFFF;
-	sz = v >> 4;
-	cz = (4096 - (v >> 4) * (v >> 4) / 4096);
-
-	/* R = Rz * Ry * Rx */
 	m->m[0][0] = (cy * cz) >> 12;
-	m->m[0][1] = ((-sy * sx * cz) >> 24) - ((sz * cx * cz) >> 24);
-	m->m[0][2] = ((-sy * cx * cz) >> 24) + ((sz * sx * cz) >> 24);
 	m->m[1][0] = (cy * sz) >> 12;
-	m->m[1][1] = ((-sy * sx * sz) >> 24) + ((cz * cx) >> 12);
-	m->m[1][2] = ((-sy * cx * sz) >> 24) - ((cz * sx) >> 12);
-	m->m[2][0] = sy;
-	m->m[2][1] = (cy * sx) >> 12;
-	m->m[2][2] = (cy * cx) >> 12;
+	m->m[2][0] = -sy;
+
+	m->m[0][1] = ((((sx * sy) >> 12) * cz) >> 12) - ((cx * sz) >> 12);
+	m->m[1][1] = ((((sx * sy) >> 12) * sz) >> 12) + ((cx * cz) >> 12);
+	m->m[2][1] = (sx * cy) >> 12;
+
+	m->m[0][2] = ((((cx * sy) >> 12) * cz) >> 12) + ((sx * sz) >> 12);
+	m->m[1][2] = ((((cx * sy) >> 12) * sz) >> 12) - ((sx * cz) >> 12);
+	m->m[2][2] = (cx * cy) >> 12;
 
 	m->t[0] = m->t[1] = m->t[2] = 0;
 }
 
 void MulMatrix0(MATRIX *m1, MATRIX *m2, MATRIX *out)
 {
-	int i, j, k;
-	long sum;
+	int i, j;
 
+	/*
+	 * RotateModel() passes the same matrix as m1 and out, so each row
+	 * of m1 is read into locals before out is written.
+	 */
 	for (i = 0; i < 3; i++) {
-		for (j = 0; j < 3; j++) {
-			sum = 0;
-			for (k = 0; k < 3; k++)
-				sum += m1->m[i][k] * m2->m[k][j];
-			out->m[i][j] = sum >> 12;
-		}
-		out->t[i] = m1->t[i];
+		long a0 = m1->m[i][0], a1 = m1->m[i][1], a2 = m1->m[i][2];
+		long t = m1->t[i];
+
+		for (j = 0; j < 3; j++)
+			out->m[i][j] = (a0 * m2->m[0][j] +
+					a1 * m2->m[1][j] +
+					a2 * m2->m[2][j]) >> 12;
+		out->t[i] = t;
 	}
 }
 
@@ -551,45 +859,26 @@ void ApplyMatrixLV(MATRIX *m, VECTOR *in, VECTOR *out)
 void GsMapModelingData(u_long *top)
 {
 	/*
-	 * In the real Gs library, this maps TMD data for the GPU.
-	 * For our immediate-mode renderer, the caller (GsLinkObject4)
-	 * stores the primitive pointer and we parse at draw time.
-	 *
-	 * The game's SetModelInfo does:
-	 *   tMemAddress++;                    // skip TMD header
-	 *   GsMapModelingData(tMemAddress);   // maps objects
-	 *   tMemAddress += 2;                  // skip to object table
-	 *   GsLinkObject4(tMemAddress, ...);  // link first object
-	 *
-	 * We just record the address; actual parsing happens in
-	 * GsSortObject4 when drawing.
+	 * The real GsMapModelingData patches a TMD's internal byte
+	 * offsets into pointers, in place.  We leave the data alone:
+	 * TMDs read from a file keep their offsets (resolved against
+	 * the object header in GsSortObject4) while the dynamic builder
+	 * stores absolute pointers, and GsSortObject4 tells the two
+	 * apart by magnitude.  Kept so SetModelInfo() reads naturally.
 	 */
 	(void)top;
 }
 
-static long obj_prim_top[16];		/* stored primitive pointers */
-static long obj_nprim[16];		/* number of primitives */
-static long obj_count = 0;
-
 void GsLinkObject4(long obj_addr, GsDOBJ2 *handler, long scale)
 {
-	TMD_OBJECT *obj;
+	TMD_OBJECT *obj = (TMD_OBJECT *)obj_addr;
 
 	(void)scale;
 
-	handler->primtop = obj_addr;
-	handler->coord2 = 0;
+	handler->primtop = obj_addr;		/* TMD object header */
+	handler->nprim = obj->n_primitive;
 	handler->attribute = 0;
 	handler->tpage = 0;
-
-	obj = (TMD_OBJECT *)obj_addr;
-	handler->nprim = obj->n_primitive;
-
-	if (obj_count < 16) {
-		obj_prim_top[obj_count] = obj_addr;
-		obj_nprim[obj_count] = obj->n_primitive;
-		obj_count++;
-	}
 }
 
 void GsLinkObject(long obj_addr, GsDOBJ2 *handler, long scale)
@@ -598,283 +887,343 @@ void GsLinkObject(long obj_addr, GsDOBJ2 *handler, long scale)
 }
 
 /*
- * Transform a 3D point to screen coordinates.
- * Uses the current ls_matrix (local-to-screen).
+ * Transform a model-space vertex through the current local-to-view
+ * matrix (ls_matrix) and project it to the screen.  The view-space
+ * depth is returned so callers can reject geometry behind the camera.
+ *
+ * The world uses the PSX convention (+X right, +Y down, +Z away from the
+ * viewer), so the vertical projection is added rather than subtracted,
+ * and coordinates are relative to the centre of the screen: the GPU's
+ * drawing offset places them in the current framebuffer.
  */
 static void transform_point(long x, long y, long z,
 			    long *sx, long *sy, long *depth)
 {
-	long wx, wy, wz;
+	long vx, vy, vz;
 	long px, py;
 
-	/* Apply local-world rotation + translation */
-	wx = (ls_matrix.m[0][0] * x + ls_matrix.m[0][1] * y +
-	      ls_matrix.m[0][2] * z) / ONE + ls_matrix.t[0];
-	wy = (ls_matrix.m[1][0] * x + ls_matrix.m[1][1] * y +
-	      ls_matrix.m[1][2] * z) / ONE + ls_matrix.t[1];
-	wz = (ls_matrix.m[2][0] * x + ls_matrix.m[2][1] * y +
-	      ls_matrix.m[2][2] * z) / ONE + ls_matrix.t[2];
+	vx = (ls_matrix.m[0][0] * x + ls_matrix.m[0][1] * y +
+	      ls_matrix.m[0][2] * z) >> 12;
+	vy = (ls_matrix.m[1][0] * x + ls_matrix.m[1][1] * y +
+	      ls_matrix.m[1][2] * z) >> 12;
+	vz = (ls_matrix.m[2][0] * x + ls_matrix.m[2][1] * y +
+	      ls_matrix.m[2][2] * z) >> 12;
+	vx += ls_matrix.t[0];
+	vy += ls_matrix.t[1];
+	vz += ls_matrix.t[2];
 
-	/* Perspective projection */
-	if (wz < 1)
-		wz = 1;
+	*depth = vz;
+	if (vz < 16) {
+		*sx = 0;
+		*sy = 0;
+		return;
+	}
 
-	px = wx * projection_distance / wz;
-	py = wy * projection_distance / wz;
+	px = (vx * projection_distance) / vz;
+	py = (vy * projection_distance) / vz;
 
-	*sx = px + gpu_width / 2 + draw_offset_x;
-	*sy = py + gpu_height / 2 + draw_offset_y;
-	*depth = wz;
+	*sx = px + gpu_width / 2;
+	*sy = py + gpu_height / 2;
+}
+
+/*
+ * ---- TMD primitive packet decoder ----
+ *
+ * A TMD packet starts with a 4-byte header whose bytes, low to high,
+ * are: olen (total packet length in 32-bit words), ilen (payload
+ * words), flag and mode (the GPU polygon command).  The payload order
+ * differs from the GPU wire format - the TMD groups texture
+ * coordinates, then colours, then vertex *indices* - so every packet
+ * is re-packed here, the indices being replaced with transformed
+ * screen coordinates.
+ */
+
+#define TMD_XY(sx, sy)	((((u_long)(sy) & 0xFFFF) << 16) | ((u_long)(sx) & 0xFFFF))
+#define TMD_UV(u, v)	((u_long)((u) & 0xFF) | (((u_long)(v) & 0xFF) << 8))
+
+static void tmd_tri(VERTEX *verts, u_short v0, u_short v1, u_short v2,
+		    long *sx0, long *sy0, long *sx1, long *sy1,
+		    long *sx2, long *sy2, long *d0, long *d1, long *d2)
+{
+	transform_point(verts[v0].vx, verts[v0].vy, verts[v0].vz, sx0, sy0, d0);
+	transform_point(verts[v1].vx, verts[v1].vy, verts[v1].vz, sx1, sy1, d1);
+	transform_point(verts[v2].vx, verts[v2].vy, verts[v2].vz, sx2, sy2, d2);
+}
+
+static void tmd_quad(VERTEX *verts, u_short v0, u_short v1, u_short v2, u_short v3,
+		     long *sx0, long *sy0, long *sx1, long *sy1, long *sx2, long *sy2,
+		     long *sx3, long *sy3, long *d0, long *d1, long *d2, long *d3)
+{
+	tmd_tri(verts, v0, v1, v2, sx0, sy0, sx1, sy1, sx2, sy2, d0, d1, d2);
+	transform_point(verts[v3].vx, verts[v3].vy, verts[v3].vz, sx3, sy3, d3);
+}
+
+/*
+ * Emit one finished polygon into the ordering table.  The bucket comes
+ * from the polygon's view-space depth and the GsSortObject4() shift
+ * argument, so GsDrawOt() can paint the scene back to front regardless
+ * of the order in which the game submitted its models.
+ */
+static void emit_poly(GsOT *ot, long shift, long depth, u_long *words, long n)
+{
+	u_long *p;
+	long i;
+
+	if (!ot || n <= 0)
+		return;
+
+	p = pkt_new(n);
+	if (!p)
+		return;
+
+	for (i = 0; i < n; i++)
+		p[i] = words[i];
+
+	if (shift < 0)
+		shift = 0;
+	else if (shift > 20)
+		shift = 20;
+
+	pkt_link(ot, depth >> shift, p);
 }
 
 void GsSortObject4(GsDOBJ2 *obj, GsOT *ot, long shift, u_long *scratch)
 {
-	TMD_OBJECT *tmd_obj;
+	TMD_OBJECT *o;
+	u_long base;
 	u_long *prim;
 	VERTEX *verts;
-	long nprim;
-	long i;
+	long nprim, i;
 
-	(void)ot; (void)shift; (void)scratch;
+	(void)scratch;
 
 	if (!obj || !obj->primtop)
 		return;
 
-	/* obj->primtop points to the OBJECT structure in TMD data */
-	tmd_obj = (TMD_OBJECT *)obj->primtop;
+	base = (u_long)obj->primtop;
+	o = (TMD_OBJECT *)base;
 
-	/* Read pointers directly from the OBJECT fields */
-	prim = (u_long *)tmd_obj->primitive_top;
-	verts = (VERTEX *)tmd_obj->vert_top;
-	nprim = tmd_obj->n_primitive;
+	/* File TMDs store offsets relative to the object header; the
+	 * dynamic builder stores absolute pointers. */
+	if (o->vert_top < 0x100000)
+		verts = (VERTEX *)(base + o->vert_top);
+	else
+		verts = (VERTEX *)o->vert_top;
 
-	if (!prim || !verts || nprim <= 0)
+	if (o->primitive_top < 0x100000)
+		prim = (u_long *)(base + o->primitive_top);
+	else
+		prim = (u_long *)o->primitive_top;
+
+	nprim = o->n_primitive;
+	if (!verts || !prim || nprim <= 0)
 		return;
 
 	for (i = 0; i < nprim; i++) {
-		/*
-		 * Each TMD primitive starts with:
-		 *   u_long mode  (packet type in low byte)
-		 *   u_long flag  (ilen/olen packed)
-		 * Then vertex indices and colors follow.
-		 *
-		 * The game's dynamic TMD format uses these modes:
-		 *   0x21 = 3-vertex flat pigment
-		 *   0x31 = 3-vertex gouraud pigment
-		 *   0x29 = 4-vertex flat pigment
-		 *   0x39 = 4-vertex gouraud pigment
-		 */
-		u_long mode = prim[0] & 0xFF;
-		u_long *p = prim;
+		u_long hdr = prim[0];
+		long olen = (long)(hdr & 0xFF);
+		long mode = (long)((hdr >> 24) & 0xFF);
+		u_long cmd = ((u_long)mode) << 24;
+		long sx0, sy0, sx1, sy1, sx2, sy2, sx3, sy3;
+		long d0, d1, d2, d3;
+		long dep = 0;
+		u_long pk[12];
+		long n = 0;
 
-		switch (mode) {
-		case 0x21: { /* 3-vertex flat */
-			/*
-			 * Layout: mode, flag, mode2, vert0/1, vert2/pad, color
-			 * (from tmd.h: FACE_3_NS_FP)
-			 */
-			u_short v0, v1, v2;
-			u_char r, g, b;
-			long sx0, sy0, d0;
-			long sx1, sy1, d1;
-			long sx2, sy2, d2;
-			VERTEX *vv;
+		if (olen < 1)
+			break;
 
-			/* skip mode, flag, mode2 = 3 u_longs */
-			p += 3;
-			v0 = (u_short)(p[0] & 0xFFFF);
-			v1 = (u_short)(p[0] >> 16);
-			v2 = (u_short)(p[1] & 0xFFFF);
-			r = (u_char)(p[1] >> 16);
-			g = (u_char)(p[2] & 0xFF);
-			b = (u_char)(p[2] >> 8) & 0xFF;
+		switch (mode & 0xFC) {
+		case 0x20: {	/* F3 - flat triangle */
+			u_short v0 = prim[2] & 0xFFFF;
+			u_short v1 = prim[2] >> 16;
+			u_short v2 = prim[3] & 0xFFFF;
 
-			vv = &verts[v0];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx0, &sy0, &d0);
-			vv = &verts[v1];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx1, &sy1, &d1);
-			vv = &verts[v2];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx2, &sy2, &d2);
-
+			tmd_tri(verts, v0, v1, v2, &sx0, &sy0, &sx1, &sy1,
+				&sx2, &sy2, &d0, &d1, &d2);
 			if (d0 > 0 && d1 > 0 && d2 > 0) {
-				gp0_send(0x20000000 |
-					 (r) | (g << 8) | (b << 16));
-				gp0_send((sy0 << 16) | sx0);
-				gp0_send((sy1 << 16) | sx1);
-				gp0_send((sy2 << 16) | sx2);
+				pk[n++] = cmd | (prim[1] & 0xFFFFFF);
+				pk[n++] = TMD_XY(sx0, sy0);
+				pk[n++] = TMD_XY(sx1, sy1);
+				pk[n++] = TMD_XY(sx2, sy2);
+				dep = (d0 + d1 + d2) / 3;
 			}
-
-			prim += 4; /* 4 u_longs per FACE_3_NS_FP */
 			break;
 		}
-		case 0x31: { /* 3-vertex gouraud */
-			u_short v0, v1, v2;
-			u_char r0, g0, b0;
-			u_char r1, g1, b1;
-			u_char r2, g2, b2;
-			long sx0, sy0, d0;
-			long sx1, sy1, d1;
-			long sx2, sy2, d2;
-			VERTEX *vv;
+		case 0x24: {	/* FT3 - flat textured triangle */
+			u_short v0 = prim[5] & 0xFFFF;
+			u_short v1 = prim[5] >> 16;
+			u_short v2 = prim[6] & 0xFFFF;
+			u_long cba = (prim[1] >> 16) & 0xFFFF;
+			u_long tsb = (prim[2] >> 16) & 0xFFFF;
+			u_long uv0 = TMD_UV(prim[1] & 0xFF, (prim[1] >> 8) & 0xFF);
+			u_long uv1 = TMD_UV(prim[2] & 0xFF, (prim[2] >> 8) & 0xFF);
+			u_long uv2 = TMD_UV(prim[3] & 0xFF, (prim[3] >> 8) & 0xFF);
 
-			p += 3;
-			v0 = (u_short)(p[0] & 0xFFFF);
-			v1 = (u_short)(p[0] >> 16);
-			v2 = (u_short)(p[1] & 0xFFFF);
-			r0 = (u_char)(p[1] >> 16);
-			g0 = (u_char)(p[2] & 0xFF);
-			b0 = (u_char)((p[2] >> 8) & 0xFF);
-			r1 = (u_char)((p[2] >> 16) & 0xFF);
-			g1 = (u_char)(p[3] & 0xFF);
-			b1 = (u_char)((p[3] >> 8) & 0xFF);
-			r2 = (u_char)((p[3] >> 16) & 0xFF);
-			g2 = (u_char)(p[4] & 0xFF);
-			b2 = (u_char)((p[4] >> 8) & 0xFF);
-
-			vv = &verts[v0];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx0, &sy0, &d0);
-			vv = &verts[v1];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx1, &sy1, &d1);
-			vv = &verts[v2];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx2, &sy2, &d2);
-
+			tmd_tri(verts, v0, v1, v2, &sx0, &sy0, &sx1, &sy1,
+				&sx2, &sy2, &d0, &d1, &d2);
 			if (d0 > 0 && d1 > 0 && d2 > 0) {
-				gp0_send(0x30000000 |
-					 (r0) | (g0 << 8) | (b0 << 16));
-				gp0_send((sy0 << 16) | sx0);
-				gp0_send((r1) | (g1 << 8) | (b1 << 16));
-				gp0_send((sy1 << 16) | sx1);
-				gp0_send((r2) | (g2 << 8) | (b2 << 16));
-				gp0_send((sy2 << 16) | sx2);
+				pk[n++] = cmd | (prim[4] & 0xFFFFFF);
+				pk[n++] = TMD_XY(sx0, sy0);
+				pk[n++] = uv0 | (cba << 16);
+				pk[n++] = TMD_XY(sx1, sy1);
+				pk[n++] = uv1 | (tsb << 16);
+				pk[n++] = TMD_XY(sx2, sy2);
+				pk[n++] = uv2;
+				dep = (d0 + d1 + d2) / 3;
 			}
-
-			prim += 6; /* 6 u_longs per FACE_3_NS_GP */
 			break;
 		}
-		case 0x29: { /* 4-vertex flat */
-			u_short v0, v1, v2, v3;
-			u_char r, g, b;
-			long sx0, sy0, d0;
-			long sx1, sy1, d1;
-			long sx2, sy2, d2;
-			long sx3, sy3, d3;
-			VERTEX *vv;
+		case 0x28: {	/* F4 - flat quad */
+			u_short v0 = prim[2] & 0xFFFF;
+			u_short v1 = prim[2] >> 16;
+			u_short v2 = prim[3] & 0xFFFF;
+			u_short v3 = prim[3] >> 16;
 
-			p += 3;
-			v0 = (u_short)(p[0] & 0xFFFF);
-			v1 = (u_short)(p[0] >> 16);
-			v2 = (u_short)(p[1] & 0xFFFF);
-			v3 = (u_short)(p[1] >> 16);
-			r = (u_char)(p[2] & 0xFF);
-			g = (u_char)((p[2] >> 8) & 0xFF);
-			b = (u_char)((p[2] >> 16) & 0xFF);
-
-			vv = &verts[v0];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx0, &sy0, &d0);
-			vv = &verts[v1];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx1, &sy1, &d1);
-			vv = &verts[v2];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx2, &sy2, &d2);
-			vv = &verts[v3];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx3, &sy3, &d3);
-
+			tmd_quad(verts, v0, v1, v2, v3, &sx0, &sy0, &sx1, &sy1,
+				 &sx2, &sy2, &sx3, &sy3, &d0, &d1, &d2, &d3);
 			if (d0 > 0 && d1 > 0 && d2 > 0 && d3 > 0) {
-				/* Two triangles for the quad */
-				gp0_send(0x20000000 |
-					 (r) | (g << 8) | (b << 16));
-				gp0_send((sy0 << 16) | sx0);
-				gp0_send((sy1 << 16) | sx1);
-				gp0_send((sy2 << 16) | sx2);
-
-				gp0_send(0x20000000 |
-					 (r) | (g << 8) | (b << 16));
-				gp0_send((sy0 << 16) | sx0);
-				gp0_send((sy2 << 16) | sx2);
-				gp0_send((sy3 << 16) | sx3);
+				pk[n++] = cmd | (prim[1] & 0xFFFFFF);
+				pk[n++] = TMD_XY(sx0, sy0);
+				pk[n++] = TMD_XY(sx1, sy1);
+				pk[n++] = TMD_XY(sx2, sy2);
+				pk[n++] = TMD_XY(sx3, sy3);
+				dep = (d0 + d1 + d2 + d3) / 4;
 			}
-
-			prim += 5; /* 5 u_longs per FACE_4_NS_FP */
 			break;
 		}
-		case 0x39: { /* 4-vertex gouraud */
-			u_short v0, v1, v2, v3;
-			u_char r0, g0, b0;
-			u_char r1, g1, b1;
-			u_char r2, g2, b2;
-			u_char r3, g3, b3;
-			long sx0, sy0, d0;
-			long sx1, sy1, d1;
-			long sx2, sy2, d2;
-			long sx3, sy3, d3;
-			VERTEX *vv;
+		case 0x2C: {	/* FT4 - flat textured quad */
+			u_short v0 = prim[6] & 0xFFFF;
+			u_short v1 = prim[6] >> 16;
+			u_short v2 = prim[7] & 0xFFFF;
+			u_short v3 = prim[7] >> 16;
+			u_long cba = (prim[1] >> 16) & 0xFFFF;
+			u_long tsb = (prim[2] >> 16) & 0xFFFF;
+			u_long uv0 = TMD_UV(prim[1] & 0xFF, (prim[1] >> 8) & 0xFF);
+			u_long uv1 = TMD_UV(prim[2] & 0xFF, (prim[2] >> 8) & 0xFF);
+			u_long uv2 = TMD_UV(prim[3] & 0xFF, (prim[3] >> 8) & 0xFF);
+			u_long uv3 = TMD_UV(prim[4] & 0xFF, (prim[4] >> 8) & 0xFF);
 
-			p += 3;
-			v0 = (u_short)(p[0] & 0xFFFF);
-			v1 = (u_short)(p[0] >> 16);
-			v2 = (u_short)(p[1] & 0xFFFF);
-			v3 = (u_short)(p[1] >> 16);
-			r0 = (u_char)(p[2] & 0xFF);
-			g0 = (u_char)((p[2] >> 8) & 0xFF);
-			b0 = (u_char)((p[2] >> 16) & 0xFF);
-			r1 = (u_char)(p[3] & 0xFF);
-			g1 = (u_char)((p[3] >> 8) & 0xFF);
-			b1 = (u_char)((p[3] >> 16) & 0xFF);
-			r2 = (u_char)(p[4] & 0xFF);
-			g2 = (u_char)((p[4] >> 8) & 0xFF);
-			b2 = (u_char)((p[4] >> 16) & 0xFF);
-			r3 = (u_char)(p[5] & 0xFF);
-			g3 = (u_char)((p[5] >> 8) & 0xFF);
-			b3 = (u_char)((p[5] >> 16) & 0xFF);
-
-			vv = &verts[v0];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx0, &sy0, &d0);
-			vv = &verts[v1];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx1, &sy1, &d1);
-			vv = &verts[v2];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx2, &sy2, &d2);
-			vv = &verts[v3];
-			transform_point(vv->vx, vv->vy, vv->vz,
-				       &sx3, &sy3, &d3);
-
+			tmd_quad(verts, v0, v1, v2, v3, &sx0, &sy0, &sx1, &sy1,
+				 &sx2, &sy2, &sx3, &sy3, &d0, &d1, &d2, &d3);
 			if (d0 > 0 && d1 > 0 && d2 > 0 && d3 > 0) {
-				gp0_send(0x30000000 |
-					 (r0) | (g0 << 8) | (b0 << 16));
-				gp0_send((sy0 << 16) | sx0);
-				gp0_send((r1) | (g1 << 8) | (b1 << 16));
-				gp0_send((sy1 << 16) | sx1);
-				gp0_send((r2) | (g2 << 8) | (b2 << 16));
-				gp0_send((sy2 << 16) | sx2);
-
-				gp0_send(0x30000000 |
-					 (r0) | (g0 << 8) | (b0 << 16));
-				gp0_send((sy0 << 16) | sx0);
-				gp0_send((r2) | (g2 << 8) | (b2 << 16));
-				gp0_send((sy2 << 16) | sx2);
-				gp0_send((r3) | (g3 << 8) | (b3 << 16));
-				gp0_send((sy3 << 16) | sx3);
+				pk[n++] = cmd | (prim[5] & 0xFFFFFF);
+				pk[n++] = TMD_XY(sx0, sy0);
+				pk[n++] = uv0 | (cba << 16);
+				pk[n++] = TMD_XY(sx1, sy1);
+				pk[n++] = uv1 | (tsb << 16);
+				pk[n++] = TMD_XY(sx2, sy2);
+				pk[n++] = uv2;
+				pk[n++] = TMD_XY(sx3, sy3);
+				pk[n++] = uv3;
+				dep = (d0 + d1 + d2 + d3) / 4;
 			}
+			break;
+		}
+		case 0x30: {	/* G3 - gouraud triangle */
+			u_short v0 = prim[4] & 0xFFFF;
+			u_short v1 = prim[4] >> 16;
+			u_short v2 = prim[5] & 0xFFFF;
 
-			prim += 8; /* 8 u_longs per FACE_4_NS_GP */
+			tmd_tri(verts, v0, v1, v2, &sx0, &sy0, &sx1, &sy1,
+				&sx2, &sy2, &d0, &d1, &d2);
+			if (d0 > 0 && d1 > 0 && d2 > 0) {
+				pk[n++] = cmd | (prim[1] & 0xFFFFFF);
+				pk[n++] = TMD_XY(sx0, sy0);
+				pk[n++] = prim[2] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx1, sy1);
+				pk[n++] = prim[3] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx2, sy2);
+				dep = (d0 + d1 + d2) / 3;
+			}
+			break;
+		}
+		case 0x34: {	/* GT3 - gouraud textured triangle */
+			u_short v0 = prim[7] & 0xFFFF;
+			u_short v1 = prim[7] >> 16;
+			u_short v2 = prim[8] & 0xFFFF;
+			u_long cba = (prim[1] >> 16) & 0xFFFF;
+			u_long tsb = (prim[2] >> 16) & 0xFFFF;
+			u_long uv0 = TMD_UV(prim[1] & 0xFF, (prim[1] >> 8) & 0xFF);
+			u_long uv1 = TMD_UV(prim[2] & 0xFF, (prim[2] >> 8) & 0xFF);
+			u_long uv2 = TMD_UV(prim[3] & 0xFF, (prim[3] >> 8) & 0xFF);
+
+			tmd_tri(verts, v0, v1, v2, &sx0, &sy0, &sx1, &sy1,
+				&sx2, &sy2, &d0, &d1, &d2);
+			if (d0 > 0 && d1 > 0 && d2 > 0) {
+				pk[n++] = cmd | (prim[4] & 0xFFFFFF);
+				pk[n++] = TMD_XY(sx0, sy0);
+				pk[n++] = uv0 | (cba << 16);
+				pk[n++] = prim[5] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx1, sy1);
+				pk[n++] = uv1 | (tsb << 16);
+				pk[n++] = prim[6] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx2, sy2);
+				pk[n++] = uv2;
+				dep = (d0 + d1 + d2) / 3;
+			}
+			break;
+		}
+		case 0x38: {	/* G4 - gouraud quad */
+			u_short v0 = prim[5] & 0xFFFF;
+			u_short v1 = prim[5] >> 16;
+			u_short v2 = prim[6] & 0xFFFF;
+			u_short v3 = prim[6] >> 16;
+
+			tmd_quad(verts, v0, v1, v2, v3, &sx0, &sy0, &sx1, &sy1,
+				 &sx2, &sy2, &sx3, &sy3, &d0, &d1, &d2, &d3);
+			if (d0 > 0 && d1 > 0 && d2 > 0 && d3 > 0) {
+				pk[n++] = cmd | (prim[1] & 0xFFFFFF);
+				pk[n++] = TMD_XY(sx0, sy0);
+				pk[n++] = prim[2] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx1, sy1);
+				pk[n++] = prim[3] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx2, sy2);
+				pk[n++] = prim[4] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx3, sy3);
+				dep = (d0 + d1 + d2 + d3) / 4;
+			}
+			break;
+		}
+		case 0x3C: {	/* GT4 - gouraud textured quad */
+			u_short v0 = prim[9] & 0xFFFF;
+			u_short v1 = prim[9] >> 16;
+			u_short v2 = prim[10] & 0xFFFF;
+			u_short v3 = prim[10] >> 16;
+			u_long cba = (prim[1] >> 16) & 0xFFFF;
+			u_long tsb = (prim[2] >> 16) & 0xFFFF;
+			u_long uv0 = TMD_UV(prim[1] & 0xFF, (prim[1] >> 8) & 0xFF);
+			u_long uv1 = TMD_UV(prim[2] & 0xFF, (prim[2] >> 8) & 0xFF);
+			u_long uv2 = TMD_UV(prim[3] & 0xFF, (prim[3] >> 8) & 0xFF);
+			u_long uv3 = TMD_UV(prim[4] & 0xFF, (prim[4] >> 8) & 0xFF);
+
+			tmd_quad(verts, v0, v1, v2, v3, &sx0, &sy0, &sx1, &sy1,
+				 &sx2, &sy2, &sx3, &sy3, &d0, &d1, &d2, &d3);
+			if (d0 > 0 && d1 > 0 && d2 > 0 && d3 > 0) {
+				pk[n++] = cmd | (prim[5] & 0xFFFFFF);
+				pk[n++] = TMD_XY(sx0, sy0);
+				pk[n++] = uv0 | (cba << 16);
+				pk[n++] = prim[6] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx1, sy1);
+				pk[n++] = uv1 | (tsb << 16);
+				pk[n++] = prim[7] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx2, sy2);
+				pk[n++] = uv2;
+				pk[n++] = prim[8] & 0xFFFFFF;
+				pk[n++] = TMD_XY(sx3, sy3);
+				pk[n++] = uv3;
+				dep = (d0 + d1 + d2 + d3) / 4;
+			}
 			break;
 		}
 		default:
-			/* Unknown mode — skip 4 u_longs as best guess */
-			prim += 4;
 			break;
 		}
+
+		if (n)
+			emit_poly(ot, shift, dep, pk, n);
+
+		prim += olen;
 	}
 }
 
@@ -891,8 +1240,8 @@ void MoveImage(RECT *src, long dest_x, long dest_y)
 {
 	/* GP0 80h: VRAM-to-VRAM blit */
 	gp0_send(0x80000000);
-	gp0_send(((unsigned int)src->y << 16) | (unsigned int)src->x);
-	gp0_send(((unsigned int)(src->h - 1) << 16) | (unsigned int)(src->w - 1));
+	gp0_send(((unsigned int)src->y << 16) | (unsigned int)(u_short)src->x);
+	gp0_send(((unsigned int)src->h << 16) | (unsigned int)(u_short)src->w);
 	gp0_send(((unsigned int)dest_y << 16) | (unsigned int)dest_x);
 }
 
@@ -902,7 +1251,7 @@ void LoadImage(RECT *rect, u_long *data)
 	long y = rect->y;
 	long w = rect->w;
 	long h = rect->h;
-	long i, j;
+	long i;
 
 	if (w <= 0 || h <= 0)
 		return;
@@ -910,7 +1259,7 @@ void LoadImage(RECT *rect, u_long *data)
 	/* GP0 A0h: CPU->VRAM transfer */
 	gp0_send(0xA0000000);
 	gp0_send(((unsigned int)y << 16) | (unsigned int)x);
-	gp0_send(((unsigned int)(h - 1) << 16) | (unsigned int)(w - 1));
+	gp0_send(((unsigned int)h << 16) | (unsigned int)w);
 
 	/* Send pixel data (16bpp = 1 u_long per 2 pixels) */
 	{
@@ -939,60 +1288,69 @@ long GetTPage(long mode, long semi, long x, long y)
 void GsGetTimInfo(u_long *tim, GsIMAGE *info)
 {
 	/*
-	 * TIM file format:
-	 *   u_long id      (0x10 = TIM file)
-	 *   u_long flags   (bit 0: CLUT present, bits 1-2: pixel mode)
-	 * If CLUT present:
-	 *   u_long clut_len
-	 *   u_short clut_x, clut_y, clut_w, clut_h
-	 *   u_short[] clut_data
-	 * Then pixel data:
-	 *   u_long pixel_len
-	 *   u_short pixel_x, pixel_y, pixel_w, pixel_h
-	 *   u_short[] pixel_data
+	 * tim points at the TIM ID word.  Layout:
+	 *
+	 *   +00  u_long  id          0x00000010
+	 *   +04  u_long  flags       bits 0-1: pixel mode
+	 *                            (0=4bpp, 1=8bpp, 2=16bpp, 3=24bpp)
+	 *   +08  u_long  clut_len    CLUT block size in bytes, header
+	 *                            included (only for 4/8bpp)
+	 *   +0c  RECT    clut_rect   x, y, w, h
+	 *   +14  ...     clut data
+	 *   ...  u_long  pix_len     pixel block size in bytes, header
+	 *                            included
+	 *   ...  RECT    pix_rect
+	 *   ...  ...     pixel data
+	 *
+	 * Note the rect widths and heights are in 16-bit VRAM units, so
+	 * the pixel data of a block is always w*h*2 bytes and LoadImage()
+	 * consumes w*h/2 words.
 	 */
-	u_long flags = tim[1];
+	extern int printf(const char *fmt, ...);
+	u_long flags;
+	u_long *p;
+	long pmode;
+	u_long len;
+	RECT *cr;
+	RECT *pr;
 
-	info->pmode = flags;
+	flags = tim[1];
+	p = &tim[2];
+	pmode = (long)(flags & 3);
 
-	if (flags & 1) {
-		/* CLUT present */
-		u_long *p = &tim[2];
-		RECT *cr = (RECT *)&p[1];
+	info->pmode = pmode;
 
+	/* Indexed modes (4bpp and 8bpp) carry a colour lookup table. */
+	if (pmode < 2) {
+		len = p[0];
+		cr = (RECT *)&p[1];
+
+		info->crect = cr;
 		info->cx = cr->x;
 		info->cy = cr->y;
 		info->cw = cr->w;
 		info->ch = cr->h;
-		info->clut = (u_long *)&p[1 + 4];
-		info->crect = cr;
+		info->clut = (u_long *)((char *)p + 12);
+		info->clutlen = len - 12;
 
-		/* Advance to pixel data */
-		p = (u_long *)((char *)p + p[0] + 4);
-		{
-			RECT *pr = (RECT *)&p[1];
-			info->px = pr->x;
-			info->py = pr->y;
-			info->pw = pr->w;
-			info->ph = pr->h;
-			info->pixel = (u_long *)&p[1 + 4];
-			info->rect = pr;
-		}
+		p = (u_long *)((char *)p + len);
 	} else {
-		/* No CLUT */
-		u_long *p = &tim[2];
-		RECT *pr = (RECT *)&p[1];
-
-		info->px = pr->x;
-		info->py = pr->y;
-		info->pw = pr->w;
-		info->ph = pr->h;
-		info->pixel = (u_long *)&p[1 + 4];
-		info->rect = pr;
-		info->cx = info->cy = info->cw = info->ch = 0;
-		info->clut = 0;
 		info->crect = 0;
+		info->clut = 0;
+		info->cx = info->cy = info->cw = info->ch = 0;
+		info->clutlen = 0;
 	}
+
+	len = p[0];
+	pr = (RECT *)&p[1];
+
+	info->rect = pr;
+	info->px = pr->x;
+	info->py = pr->y;
+	info->pw = pr->w;
+	info->ph = pr->h;
+	info->pixel = (u_long *)((char *)p + 12);
+	info->pixlen = len - 12;
 }
 
 /*
