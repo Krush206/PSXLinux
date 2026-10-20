@@ -115,11 +115,90 @@ def fltfmt(f):
     """Emit a float constant that GCC 2.91 accepts."""
     return "%.5ff" % f
 
+def lod_cluster(verts, norms, faces, step):
+    """Vertex-clustering LOD: snap vertices to a coarse grid, weld
+    coincident ones, average their normals, and drop faces that
+    degenerate.  Unlike area cutoffs this keeps the mesh
+    watertight - no holes - at the cost of a chunkier silhouette,
+    which suits the PSX-era look.  Returns new (verts, norms, faces).
+
+    The per-face vertex list already carries (vi, ni) pairs; the
+    clustered face keeps the ORIGINAL vertex order so the winding
+    (and thus the lighting sidedness) is preserved.
+    """
+    def key(p):
+        return (round(p[0] / step), round(p[1] / step), round(p[2] / step))
+
+    cluster = {}                      # grid key -> new vertex index
+    new_verts = []
+    # accumulated normals per new vertex
+    new_norm_acc = []
+    remap = {}                        # old vertex index -> new index
+
+    def weld(old_vi):
+        if old_vi in remap:
+            return remap[old_vi]
+        p = verts[old_vi - 1]          # OBJ indices are 1-based
+        k = key(p)
+        if k not in cluster:
+            cluster[k] = len(new_verts)
+            new_verts.append(list(p))
+            new_norm_acc.append([0.0, 0.0, 0.0])
+        ni = cluster[k]
+        remap[old_vi] = ni
+        return ni
+
+    new_faces = []
+    for mat, idx in faces:
+        seq = []
+        for vi, nri in idx:
+            ni = weld(vi)
+            if nri:
+                n = norms[nri - 1]
+                a = new_norm_acc[ni]
+                a[0] += n[0]; a[1] += n[1]; a[2] += n[2]
+            if not seq or seq[-1] != ni:      # collapse runs
+                seq.append(ni)
+        if len(seq) > 1 and seq[0] == seq[-1]:
+            seq.pop()
+        if len(seq) >= 3:
+            new_faces.append((mat, seq))
+
+    # unit-ize the averaged normals (the converter inverts them
+    # later, exactly like the original pipeline)
+    new_norms = []
+    for a in new_norm_acc:
+        l = (a[0]*a[0] + a[1]*a[1] + a[2]*a[2]) ** 0.5
+        if l < 1e-12:
+            l = 1.0
+        new_norms.append([a[0]/l, a[1]/l, a[2]/l])
+    return new_verts, new_norms, new_faces
+
+# LOD grid step in rescaled units (model is CYCLE_HEIGHT tall).
+# 1.5 welds the 184-face mesh down to ~76 faces while keeping all
+# four material parts (body, front wheel, metal, window) distinct;
+# from chase-cam distance the silhouette is unchanged and the
+# chunkier shading suits the PSX-era look.
+LOD_STEP = 1.5
+
 def gen_model():
     verts, norms, faces, mat_list = load_obj()
     bbox = rescale(verts, CYCLE_HEIGHT)
-    print(f"model: {len(verts)} verts, {len(norms)} norms, {len(faces)} faces, "
-          f"{len(mat_list)} materials, bbox={bbox}")
+    n_orig = len(faces)
+    # LOD: cluster-weld the mesh (see lod_cluster).  Faces that
+    # welded into polygons larger than MODEL_FACESIZE are split
+    # back into triangles.
+    verts, norms, faces = lod_cluster(verts, norms, faces, LOD_STEP)
+    split = []
+    for mat, seq in faces:
+        if len(seq) > MODEL_FACESIZE:
+            for k in range(1, len(seq) - 1):
+                split.append((mat, [seq[0], seq[k], seq[k+1]]))
+        else:
+            split.append((mat, seq))
+    faces = [(mat, [(vi, vi) for vi in seq]) for mat, seq in split]
+    print(f"model: {n_orig} faces -> LOD {len(faces)} faces "
+          f"({len(verts)} welded verts), {len(mat_list)} materials, bbox={bbox}")
     out = []
     w = out.append
     w("/*\n * psx_model_data.c - GLTron light cycle model (Blender Wavefront\n"
