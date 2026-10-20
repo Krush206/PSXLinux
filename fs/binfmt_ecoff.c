@@ -227,7 +227,11 @@ static int load_ecoff_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 	{
 		unsigned long sp;
 		unsigned long stack_top = text_addr + total_size +
-					  0x4000; /* 16K above image */
+					  0x6000; /* 24K above image;
+						     keeps the stack top
+						     inside the 0x1B0000
+						     user-program
+						     reservation */
 		sp = stack_top & ~7;
 
 		/* Push argv[0] filename onto stack */
