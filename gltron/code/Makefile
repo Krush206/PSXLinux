@@ -32,7 +32,7 @@ gltron.bflt: $(OBJS) $(LIBOBJS)
 
 ../../psxdev/miniglut.o: ../../psxdev/miniglut.c ../../psxdev/miniglut.h \
 			   ../../psxdev/minigl.h
-	$(CC) $(CFLAGS) -I../../psxdev -c -o $@ ../../psxdev/miniglut.c
+	$(CC) $(CFLAGS) -I../../psxdev -c -o $@ $<
 
 ../../psxdev/minilibc.o: ../../psxdev/minilibc.c ../../psxdev/minilibc.h
 	$(CC) $(CFLAGS) -I../../psxdev -c -o $@ ../../psxdev/minilibc.c
