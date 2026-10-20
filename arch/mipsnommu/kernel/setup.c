@@ -613,7 +613,9 @@ void __init setup_arch(char **cmdline_p)
 	 * Reserve the user-program area (0x00100000..0x001B0000, 704KB)
 	 * so the kernel allocators never hand these pages out.  The
 	 * ECOFF binaries load at 0x00100000; GLTron's text+bss spans
-	 * up to ~0x1A8000, so reserve with headroom to 0x1B0000.
+	 * up to ~0x1A9000 and the ECOFF loader places the 24KB program
+	 * stack 0x6000 above the image end (top ≈ 0x1AF90C), which
+	 * stays inside this reservation.
 	 */
 	reserve_bootmem(0x00100000, 0x001B0000 - 0x00100000);
 	early_putc('F');
