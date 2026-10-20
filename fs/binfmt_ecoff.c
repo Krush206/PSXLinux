@@ -29,6 +29,8 @@
 #include <linux/init.h>
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
+#include <asm/mipsregs.h>
+#include <asm/isadep.h>
 
 /*
  * ECOFF structures (same as arch/mipsnommu/boot/ecoff.h but using
@@ -197,6 +199,20 @@ static int load_ecoff_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 			printk(KERN_ERR "ECOFF: first words at %08x: "
 			       "%08x %08x\n", text_addr, p[0], p[1]);
 		}
+
+		/* Zero the BSS: the kernel guarantees cleared BSS for
+		 * freshly exec'd programs.  On this no-MMU target the
+		 * RAM under the image still holds kernel slab/buffer
+		 * data, so skipping this leaves every global variable
+		 * as garbage (matrices, OTs, tables...). */
+		if (ah.bsize) {
+			unsigned int baddr = ah.text_start + ah.tsize +
+					     ah.dsize;
+
+			printk(KERN_DEBUG "ECOFF: zeroing bss %08x..%08x\n",
+			       baddr, baddr + ah.bsize);
+			memset((void *)baddr, 0, ah.bsize);
+		}
 	}
 
 	/* Set up the process memory map (no-MMU style) */
@@ -228,10 +244,18 @@ static int load_ecoff_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 	}
 
 	/*
-	 * On a no-MMU system, user programs run in kernel mode
-	 * (there's no TLB to translate KUSEG addresses from user mode).
-	 * Just set the PC and SP without switching to KU_USER.
+	 * Start the program in USER mode, exactly like start_thread():
+	 * the exception entry code derives `current` from the stack
+	 * pointer when entering from kernel mode (CU0 set), which would
+	 * compute a garbage task_struct from the program's own stack.
+	 * In user mode the entry code switches to the task's kernel
+	 * stack (kernelsp) instead, keeping `current` valid.
+	 *
+	 * On the PSX no TLB setup is needed: the 2 MB RAM and the
+	 * hardware registers are mirrored throughout KUSEG, so user
+	 * mode can access text/data/stack without wired TLB entries.
 	 */
+	regs->cp0_status = (regs->cp0_status & ~ST0_CU0) | KU_USER;
 	regs->cp0_epc = ah.entry;
 	regs->regs[29] = current->mm->start_stack;
 
