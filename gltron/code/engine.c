@@ -1,4 +1,5 @@
 #include "gltron.h"
+extern int printf(const char *fmt, ...);
 #include "psxdata.h"
 
 void setCol(int x, int y) {
@@ -79,6 +80,14 @@ void changeDisplay() {
 }
 
 void initGame() { /* called when game mode is entered */
+  /* The PSX port skips the GUI menus, so the viewports are set
+   * up here instead: initGameScreen() sizes game->screen from
+   * the settings, changeDisplay() marks the viewports that
+   * drawGame() renders (display->onScreen = 1).  Without this
+   * the per-player viewport loop in drawGame() draws nothing
+   * and every frame is just the black clear. */
+  initGameScreen();
+  changeDisplay();
 }
 
 void initGameStructures() { /* called only once */
