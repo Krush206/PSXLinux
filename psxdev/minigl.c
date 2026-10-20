@@ -713,9 +713,9 @@ void glClear(GLbitfield mask)
 		unsigned g = (unsigned)(clear_color[1] * 31.0f) & 31;
 		unsigned b = (unsigned)(clear_color[2] * 31.0f) & 31;
 
-		/* 0x02: raw-VRAM fill rectangle */
-		gp0_send(0x02000000);
-		gp0_send((u32)(r | (g << 5) | (b << 10)));
+		/* 0x02: raw-VRAM fill rectangle — the 15-bit color
+		 * goes IN the command word; the packet is 3 words */
+		gp0_send(0x02000000u | (u32)(r | (g << 5) | (b << 10)));
 		gp0_send(((u32)y << 16) | (u32)x);
 		gp0_send(((u32)SCREEN_H << 16) | (u32)SCREEN_W);
 	}
@@ -1167,10 +1167,20 @@ static void emit_tri(const Vtx *a, const Vtx *b, const Vtx *c)
 	}
 }
 
-/* Emit one clipped screen-space quad. */
+/* Emit one clipped screen-space quad.
+ *
+ * The GPU rasterizes the four vertices as a triangle STRIP:
+ * (v1,v2,v3) + (v2,v3,v4), sharing the v2-v3 edge.  For that edge
+ * to be the quad's diagonal the vertices must arrive in GTE
+ * "zigzag" order (TL,TR,BL,BR), not cyclic order — cyclic input
+ * makes v2-v3 a boundary edge and the quad renders as a bowtie
+ * with a wedge missing.  minigl collects cyclic order, so swap
+ * the last two vertices here. */
 static void emit_quad(const Vtx *a, const Vtx *b,
-		      const Vtx *c, const Vtx *d)
+		      const Vtx *c_in, const Vtx *d_in)
 {
+	/* cyclic (a,b,c,d) -> zigzag (a,b,d,c) */
+	const Vtx *t = c_in, *c = d_in, *d = t;
 	u32 cmd;
 	int semi = st_blend ? 1 : 0;
 	int gouraud = st_shade_smooth;
@@ -1258,14 +1268,30 @@ static void clip_lerp(Vtx *out, const Vtx *a, const Vtx *b, float t)
  * Clip a vertex fan against the near plane (clip w > W_EPS).
  * Input: v[0..n-1] with clip coords in c[0..3]; output: the clipped
  * polygon replaces v, new count returned (0 if fully culled).
+ *
+ * The scratch buffer is static, not on the stack: uClinux gives
+ * user programs only a small stack, and a 4 KB local here used
+ * to overflow it and corrupt the packet arena.
  */
+static Vtx clip_out[MAX_VERTS];
+
 static int clip_near(Vtx *v, int n)
 {
-	Vtx out[8];
+	Vtx *out = clip_out;
 	int m = 0, i;
 
 	if (n < 2)
 		return 0;
+
+	/* fast path: no vertex crosses the near plane — pass the
+	 * polygon through untouched.  Without this the 8-slot
+	 * output buffer below silently truncated every larger
+	 * fan/strip (Tux lost his belly, GLTron its trails). */
+	for (i = 0; i < n; i++)
+		if (v[i].c[3] <= W_EPS)
+			break;
+	if (i == n)
+		return n;
 
 	for (i = 0; i < n; i++) {
 		const Vtx *a = &v[i];
@@ -1275,7 +1301,7 @@ static int clip_near(Vtx *v, int n)
 
 		if (ain) {
 			out[m++] = *a;
-			if (m >= 8) break;
+			if (m >= MAX_VERTS) break;
 		}
 		if (ain != bin) {
 			float t = (a->c[3] - W_EPS) /
@@ -1283,7 +1309,7 @@ static int clip_near(Vtx *v, int n)
 
 			clip_lerp(&out[m], a, b, t);
 			m++;
-			if (m >= 8) break;
+			if (m >= MAX_VERTS) break;
 		}
 	}
 
@@ -1314,7 +1340,7 @@ void glEnd(void)
 	switch (prim_mode) {
 	case GL_TRIANGLES:
 		for (i = 0; i + 2 < prim_n; i += 3) {
-			Vtx tri[3];
+			Vtx tri[4];       /* a straddling tri clips to 4 */
 			int j, m;
 
 			for (j = 0; j < 3; j++)
@@ -1349,35 +1375,30 @@ void glEnd(void)
 
 	case GL_POLYGON:
 	case GL_TRIANGLE_FAN: {
-		Vtx poly[MAX_VERTS];
-		int m;
+		/* clip in place on the glBegin buffer — a local
+		 * MAX_VERTS copy overflowed the 16K user stack */
+		int m = clip_near(verts, prim_n);
 
-		for (i = 0; i < prim_n; i++)
-			poly[i] = verts[i];
-		m = clip_near(poly, prim_n);
 		if (m >= 3)
 			for (i = 1; i + 1 < m; i++)
-				emit_tri(&poly[0], &poly[i], &poly[i + 1]);
+				emit_tri(&verts[0], &verts[i],
+					 &verts[i + 1]);
 		break;
 	}
 
 	case GL_TRIANGLE_STRIP: {
-		Vtx strip[MAX_VERTS];
-		int m;
+		int m = clip_near(verts, prim_n);
 
-		for (i = 0; i < prim_n; i++)
-			strip[i] = verts[i];
-		m = clip_near(strip, prim_n);
 		if (m >= 3)
 			for (i = 0; i + 2 < m; i++)
-				emit_tri(&strip[i], &strip[i + 1],
-					 &strip[i + 2]);
+				emit_tri(&verts[i], &verts[i + 1],
+					 &verts[i + 2]);
 		break;
 	}
 
 	case GL_LINES:
 		for (i = 0; i + 1 < prim_n; i += 2) {
-			Vtx seg[2];
+			Vtx seg[3];       /* a straddling line clips to 3 */
 			int j, m;
 
 			for (j = 0; j < 2; j++)
@@ -1389,16 +1410,12 @@ void glEnd(void)
 		break;
 
 	case GL_LINE_LOOP: {
-		Vtx loop[MAX_VERTS];
-		int m;
+		int m = clip_near(verts, prim_n);
 
-		for (i = 0; i < prim_n; i++)
-			loop[i] = verts[i];
-		m = clip_near(loop, prim_n);
 		if (m >= 2) {
 			for (i = 0; i + 1 < m; i++)
-				emit_line(&loop[i], &loop[i + 1]);
-			emit_line(&loop[m - 1], &loop[0]);
+				emit_line(&verts[i], &verts[i + 1]);
+			emit_line(&verts[m - 1], &verts[0]);
 		}
 		break;
 	}
