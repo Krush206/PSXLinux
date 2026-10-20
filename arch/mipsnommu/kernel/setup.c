@@ -610,12 +610,12 @@ void __init setup_arch(char **cmdline_p)
 	early_putc('6');
 
 	/*
-	 * Reserve the user-program area (0x00100000..0x001A0000, 640KB)
-	 * so the page cache never allocates these pages.  This must be
-	 * done here (before free_all_bootmem) so the buddy allocator
-	 * never puts these pages on its free lists.
+	 * Reserve the user-program area (0x00100000..0x001B0000, 704KB)
+	 * so the kernel allocators never hand these pages out.  The
+	 * ECOFF binaries load at 0x00100000; GLTron's text+bss spans
+	 * up to ~0x1A8000, so reserve with headroom to 0x1B0000.
 	 */
-	reserve_bootmem(0x00100000, 0x001A0000 - 0x00100000);
+	reserve_bootmem(0x00100000, 0x001B0000 - 0x00100000);
 	early_putc('F');
 
 #if 0
