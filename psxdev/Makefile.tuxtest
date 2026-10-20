@@ -1,0 +1,28 @@
+# tuxtest build — standalone minigl smoke test.
+
+CC       = mipsel-linux-gcc
+CFLAGS   = -nostdlib -static -G0 -O2 -Wall -fno-pic -mno-abicalls \
+	   -mcpu=r3000 -mips1 -msoft-float -fomit-frame-pointer -DNO_MM
+INC      = -I. -I../../psxdev
+LDFLAGS  = -Wl,-T,psxdev.ld -e _start
+
+E2E      = /opt/PSXLinux/arch/mipsnommu/boot/elf2ecoff
+
+all: tuxtest.bflt
+
+tuxtest.bflt: tuxtest.c minigl.o miniglut.o minilibc.o libsoftfp.a
+	$(CC) $(CFLAGS) $(INC) $(LDFLAGS) -o tuxtest.elf tuxtest.c \
+	      minigl.o miniglut.o minilibc.o libsoftfp.a
+	$(E2E) tuxtest.elf tuxtest.bflt
+
+minigl.o: minigl.c minigl.h
+	$(CC) $(CFLAGS) -I../../psxdev -c -o $@ minigl.c
+
+miniglut.o: miniglut.c miniglut.h minigl.h
+	$(CC) $(CFLAGS) -I../../psxdev -c -o $@ miniglut.c
+
+minilibc.o: minilibc.c minilibc.h
+	$(CC) $(CFLAGS) -I../../psxdev -c -o $@ minilibc.c
+
+clean:
+	rm -f *.o *.elf *.bflt
