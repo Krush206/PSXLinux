@@ -414,7 +414,19 @@ void drawCam(Player *p, gDisplay *d) {
 
   glMatrixMode(GL_MODELVIEW);
   glLoadIdentity();
-  glLightfv(GL_LIGHT0, GL_POSITION, p->camera->cam);
+  {
+    /* directional light (w=0): a 4-component position; passing
+     * camera->cam (float[3]) directly reads one float past the
+     * array, which turned the light positional and forced a
+     * per-vertex sqrt in the lighting path */
+    static GLfloat lpos[4];
+
+    lpos[0] = p->camera->cam[0];
+    lpos[1] = p->camera->cam[1];
+    lpos[2] = p->camera->cam[2];
+    lpos[3] = 0.0f;
+    glLightfv(GL_LIGHT0, GL_POSITION, lpos);
+  }
 
   gluLookAt(p->camera->cam[0], p->camera->cam[1], p->camera->cam[2],
 	    p->camera->target[0], p->camera->target[1], p->camera->target[2],
@@ -423,7 +435,6 @@ void drawCam(Player *p, gDisplay *d) {
   drawFloor(d);
   if(game->settings->show_wall == 1)
     drawWalls(d);
-
   for(i = 0; i < game->players; i++)
     drawTraces(&(game->player[i]), d, i);
 
