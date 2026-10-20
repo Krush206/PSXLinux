@@ -42,6 +42,7 @@ extern double sin(double);
 extern double cos(double);
 extern double tan(double);
 extern double sqrt(double);
+extern int printf(const char *fmt, ...);
 
 /* ------------------------------------------------------- /dev/psxgpu
  *
@@ -416,7 +417,11 @@ void gluLookAt(GLdouble ex, GLdouble ey, GLdouble ez,
 
 	m.m[12] = -(sx * (float)ex + sy * (float)ey + sz * (float)ez);
 	m.m[13] = -(rx * (float)ex + ry * (float)ey + rz * (float)ez);
-	m.m[14] = -(fx * (float)ex + fy * (float)ey + fz * (float)ez);
+	/* NB: row 3 is -f, so the translation is +f*eye (not -f*eye):
+	 * eye-space z = -f.p + f.eye = -f.(p - eye);  with the wrong
+	 * sign every point in front of the camera lands behind the
+	 * near plane and clip_near() culls the whole scene. */
+	m.m[14] = (fx * (float)ex + fy * (float)ey + fz * (float)ez);
 
 	if (cur_matrix == GL_MODELVIEW)
 		mat_apply(&mv, &m);
@@ -524,18 +529,25 @@ void glBindTexture(GLenum target, GLuint id)
 	if (id < MAX_TEX && texs[id].used) {
 		bound_tex = &texs[id];
 		t = bound_tex;
-		/* Texture window (E6h): GL_REPEAT wraps within the
-		 * texture (mask = size-1 per axis); GL_CLAMP passes
-		 * through. */
+		/* Texture window (GP0(E2h)): GL_REPEAT wraps UVs within the
+		 * texture.  The E2h mask fields are in 8-pixel steps, so the
+		 * tiling code maps the power-of-two size; GL_CLAMP passes
+		 * UVs through unchanged (mask = all bits).
+		 * NB: this is E2h, NOT E6h - E6h is the mask-bit setting
+		 * ("reject pixels with bit15 set"), which breaks drawing. */
 		if (t->wrap_s == GL_REPEAT)
-			mx = (u32)(t->w - 1) & 0xFF;
+			mx = (t->w <= 8) ? 31 : (t->w <= 16) ? 30 :
+			      (t->w <= 32) ? 28 : (t->w <= 64) ? 24 :
+			      (t->w <= 128) ? 16 : 0;
 		else
-			mx = 0x3F;
+			mx = 31;
 		if (t->wrap_t == GL_REPEAT)
-			my = (u32)(t->h - 1) & 0xFF;
+			my = (t->h <= 8) ? 31 : (t->h <= 16) ? 30 :
+			      (t->h <= 32) ? 28 : (t->h <= 64) ? 24 :
+			      (t->h <= 128) ? 16 : 0;
 		else
-			my = 0xFF;
-		gp0_send(0xE6000000u | mx | (my << 8));
+			my = 31;
+		gp0_send(0xE2000000u | mx | (my << 5));
 	} else {
 		bound_tex = 0;
 	}
@@ -721,6 +733,29 @@ static void copy4(GLfloat *dst, const GLfloat *src)
 	dst[2] = src[2]; dst[3] = src[3];
 }
 
+static GLfloat light_pos[4];
+static GLfloat light_dir[3] = { 0.0f, 0.0f, -1.0f };  /* normalized, for w==0 */
+
+static void light_update_dir(void)
+{
+	float len;
+
+	if (light_pos[3] != 0.0f)
+		return;                     /* positional: per-vertex path */
+	len = (float)sqrt((double)(light_pos[0] * light_pos[0] +
+				   light_pos[1] * light_pos[1] +
+				   light_pos[2] * light_pos[2]));
+	if (len > 0.0f) {
+		light_dir[0] = -light_pos[0] / len;
+		light_dir[1] = -light_pos[1] / len;
+		light_dir[2] = -light_pos[2] / len;
+	} else {
+		light_dir[0] = 0.0f;
+		light_dir[1] = 0.0f;
+		light_dir[2] = -1.0f;
+	}
+}
+
 void glLightfv(GLenum light, GLenum pname, const GLfloat *params)
 {
 	(void)light;                             /* only GL_LIGHT0 */
@@ -732,7 +767,10 @@ void glLightfv(GLenum light, GLenum pname, const GLfloat *params)
 		light_ambient[1] += params[1] * 0.5f;
 		light_ambient[2] += params[2] * 0.5f;
 		break;
-	case GL_POSITION: copy4(light_pos, params); break;
+	case GL_POSITION:
+		copy4(light_pos, params);
+		light_update_dir();
+		break;
 	default: break;
 	}
 }
@@ -972,20 +1010,11 @@ static void transform_vertex(Vtx *v)
 		nz = mv.m[2] * v->nx + mv.m[6] * v->ny + mv.m[10] * v->nz;
 
 		if (light_pos[3] == 0.0f) {
-			float len = (float)sqrt((double)(
-				light_pos[0] * light_pos[0] +
-				light_pos[1] * light_pos[1] +
-				light_pos[2] * light_pos[2]));
-
-			if (len > 0.0f) {
-				float inv = 1.0f / len;
-
-				lx = -light_pos[0] * inv;
-				ly = -light_pos[1] * inv;
-				lz = -light_pos[2] * inv;
-			} else {
-				lx = 0.0f; ly = 0.0f; lz = -1.0f;
-			}
+			/* directional light: direction precomputed once in
+			 * glLightfv (light_dir) — no per-vertex sqrt */
+			lx = light_dir[0];
+			ly = light_dir[1];
+			lz = light_dir[2];
 		} else {
 			float px = light_pos[0] / light_pos[3];
 			float py = light_pos[1] / light_pos[3];
@@ -1103,7 +1132,9 @@ static void emit_tri(const Vtx *a, const Vtx *b, const Vtx *c)
 		u32 tsb = (u32)bound_tex->tpage_bits;
 		const Vtx *vp[3];
 
-		cmd = (gouraud ? 0x34u : 0x24u) + (u32)semi;
+		/* semi-transparency = ABE = command bit 25, i.e. +2 in
+		 * the low byte (bit 24 is TGE: raw-texture mode) */
+		cmd = ((gouraud ? 0x34u : 0x24u) | ((u32)semi << 1)) << 24;
 		pk = pkt_new(gouraud ? 9 : 7);
 		if (!pk)
 			return;
@@ -1121,7 +1152,7 @@ static void emit_tri(const Vtx *a, const Vtx *b, const Vtx *c)
 	} else {
 		const Vtx *vp[4];
 
-		cmd = (gouraud ? 0x30u : 0x20u) + (u32)semi;
+		cmd = ((gouraud ? 0x30u : 0x20u) | ((u32)semi << 1)) << 24;
 		pk = pkt_new(gouraud ? 6 : 4);
 		if (!pk)
 			return;
@@ -1150,7 +1181,7 @@ static void emit_quad(const Vtx *a, const Vtx *b,
 	if (st_texture_2d && bound_tex) {
 		u32 tsb = (u32)bound_tex->tpage_bits;
 
-		cmd = (gouraud ? 0x3Cu : 0x2Cu) + (u32)semi;
+		cmd = ((gouraud ? 0x3Cu : 0x2Cu) | ((u32)semi << 1)) << 24;
 		pk = pkt_new(gouraud ? 12 : 9);
 		if (!pk)
 			return;
@@ -1167,7 +1198,7 @@ static void emit_quad(const Vtx *a, const Vtx *b,
 		pk[2 + n++] = xy_word(d);
 		pk[2 + n++] = uv_word(d);
 	} else {
-		cmd = (gouraud ? 0x38u : 0x28u) + (u32)semi;
+		cmd = ((gouraud ? 0x38u : 0x28u) | ((u32)semi << 1)) << 24;
 		pk = pkt_new(gouraud ? 8 : 5);
 		if (!pk)
 			return;
@@ -1187,7 +1218,7 @@ static void emit_quad(const Vtx *a, const Vtx *b,
 /* Emit one clipped screen-space line. */
 static void emit_line(const Vtx *a, const Vtx *b)
 {
-	u32 cmd = 0x40u + (st_blend ? 1u : 0u);
+	u32 cmd = (0x40u | ((st_blend ? 1u : 0u) << 1)) << 24;
 	u_long *pk;
 	const Vtx *vp[4];
 
@@ -1387,13 +1418,13 @@ int glMiniInit(void)
 	if (gpu_open() < 0)
 		return -1;
 
-	/* display: 320x240 (register values proven by the kernel's GPU
-	 * demo and libps_compat.c) */
+	/* display: 320x240 NTSC (register values from psx-spx:
+	 * GP1(06h) X1=600/X2=3160, GP1(07h) Y1=0x10/Y2=0x100) */
 	gp1_send(0x00000000);              /* soft reset */
 	gp1_send(0x03000000);              /* display enable */
 	gp1_send(0x08000001);              /* 320x240 mode */
-	gp1_send(0x0602C0C60);             /* horizontal range */
-	gp1_send(0x07000410);              /* vertical range 0x10..0x100 */
+	gp1_send(0x060C58258);             /* h range: 600..3160 */
+	gp1_send(0x07040010);              /* v range: 16..256 */
 
 	active_buff = 0;
 	show_buffer(0);
