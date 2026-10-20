@@ -83,7 +83,11 @@ static sint gpu_fd = -1;
 
 /* GP0 batching: one write() syscall amortizes the FIFO waits for a
  * whole batch of command words. */
-#define GP0_BATCH 256
+/* 512-word write batches: the kernel driver re-batches internally,
+ * so this only sets the syscall granularity.  Kept small because
+ * the buffer is BSS and the image-size budget is tight (see
+ * ARENA_WORDS above). */
+#define GP0_BATCH 512
 static u32 gp0_batch[GP0_BATCH];
 static int gp0_batch_n;
 
@@ -160,7 +164,16 @@ static void show_buffer(int idx)
 
 #define OT_BITS 10
 #define OT_SIZE (1 << OT_BITS)
-#define ARENA_WORDS 24576
+/*
+ * Packet arena.  A frame builds ~360 packets of 4..9 words (~2.5k
+ * words); 8k words is a generous ceiling.  The arena is BSS and the
+ * user-program image must stay below ~0x1AA0A0 so the 24K stack
+ * top (image end + 0x6000) fits inside the kernel's 0x1B0000
+ * reservation — the old 24k-word arena alone blew that budget by
+ * pushing the stack into memory the boot allocator had given away
+ * (the symptom was a dead /dev/psxgpu: all-black frames).
+ */
+#define ARENA_WORDS 8192
 
 static u_long  ot[2][OT_SIZE];   /* linked-list heads, one per buffer */
 static u_long  pkt_arena[ARENA_WORDS];
@@ -230,6 +243,10 @@ static Mat4 mv;
 static Mat4 proj;
 static GLenum cur_matrix = GL_MODELVIEW;
 
+/* set by every matrix/light/material/fog mutation; the per-vertex
+ * fixed-point state is refreshed lazily at the next glBegin */
+static int  fx_dirty = 1;
+
 static void mat_apply(Mat4 *a, const Mat4 *b)
 {
 	float r[16];
@@ -266,6 +283,7 @@ void glPopMatrix(void)
 		if (mv_sp > 0)
 			mv = mv_stack[--mv_sp];
 	}
+	fx_dirty = 1;
 }
 
 void glLoadIdentity(void)
@@ -274,6 +292,7 @@ void glLoadIdentity(void)
 		mv = ident_mat;
 	else
 		proj = ident_mat;
+	fx_dirty = 1;
 }
 
 void glLoadMatrixf(const GLfloat *m)
@@ -283,6 +302,7 @@ void glLoadMatrixf(const GLfloat *m)
 
 	for (i = 0; i < 16; i++)
 		t->m[i] = m[i];
+	fx_dirty = 1;
 }
 
 void glTranslatef(GLfloat x, GLfloat y, GLfloat z)
@@ -294,6 +314,7 @@ void glTranslatef(GLfloat x, GLfloat y, GLfloat z)
 		mat_apply(&mv, &t);
 	else
 		mat_apply(&proj, &t);
+	fx_dirty = 1;
 }
 
 void glRotatef(GLfloat deg, GLfloat ax, GLfloat ay, GLfloat az)
@@ -327,6 +348,7 @@ void glRotatef(GLfloat deg, GLfloat ax, GLfloat ay, GLfloat az)
 		mat_apply(&mv, &r);
 	else
 		mat_apply(&proj, &r);
+	fx_dirty = 1;
 }
 
 void glScalef(GLfloat x, GLfloat y, GLfloat z)
@@ -338,6 +360,7 @@ void glScalef(GLfloat x, GLfloat y, GLfloat z)
 		mat_apply(&mv, &s);
 	else
 		mat_apply(&proj, &s);
+	fx_dirty = 1;
 }
 
 void glOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t,
@@ -355,6 +378,7 @@ void glOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t,
 		mat_apply(&mv, &o);
 	else
 		mat_apply(&proj, &o);
+	fx_dirty = 1;
 }
 
 void gluPerspective(GLdouble fovy, GLdouble aspect,
@@ -379,6 +403,7 @@ void gluPerspective(GLdouble fovy, GLdouble aspect,
 		mat_apply(&mv, &p);
 	else
 		mat_apply(&proj, &p);
+	fx_dirty = 1;
 }
 
 void gluLookAt(GLdouble ex, GLdouble ey, GLdouble ez,
@@ -441,9 +466,9 @@ static int st_depth_mask = 1;
 
 static GLfloat clear_color[4];
 
-static GLfloat cur_color[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
-static GLfloat cur_uv[2];
-static GLfloat cur_normal[3] = { 0.0f, 0.0f, 1.0f };
+static int    cur_color[4] = { 255, 255, 255, 255 };   /* 0..255 */
+static int    cur_uv[2];                               /* Q8.8 */
+static int    cur_normal[3] = { 0, 0, 16384 };         /* Q2.14 */
 
 static GLfloat mat_ambient[4]  = { 0.2f, 0.2f, 0.2f, 1.0f };
 static GLfloat mat_diffuse[4]  = { 0.8f, 0.8f, 0.8f, 1.0f };
@@ -760,8 +785,8 @@ void glLightfv(GLenum light, GLenum pname, const GLfloat *params)
 {
 	(void)light;                             /* only GL_LIGHT0 */
 	switch (pname) {
-	case GL_AMBIENT:  copy4(light_ambient, params); break;
-	case GL_DIFFUSE:  copy4(light_diffuse, params); break;
+	case GL_AMBIENT:  copy4(light_ambient, params); fx_dirty = 1; break;
+	case GL_DIFFUSE:  copy4(light_diffuse, params); fx_dirty = 1; break;
 	case GL_SPECULAR: /* folded into ambient (cheap but stable) */
 		light_ambient[0] += params[0] * 0.5f;
 		light_ambient[1] += params[1] * 0.5f;
@@ -770,6 +795,7 @@ void glLightfv(GLenum light, GLenum pname, const GLfloat *params)
 	case GL_POSITION:
 		copy4(light_pos, params);
 		light_update_dir();
+		fx_dirty = 1;
 		break;
 	default: break;
 	}
@@ -779,8 +805,8 @@ void glMaterialfv(GLenum face, GLenum pname, const GLfloat *params)
 {
 	(void)face;                              /* FRONT_AND_BACK only */
 	switch (pname) {
-	case GL_AMBIENT:  copy4(mat_ambient, params); break;
-	case GL_DIFFUSE:  copy4(mat_diffuse, params); break;
+	case GL_AMBIENT:  copy4(mat_ambient, params); fx_dirty = 1; break;
+	case GL_DIFFUSE:  copy4(mat_diffuse, params); fx_dirty = 1; break;
 	case GL_SPECULAR: copy4(mat_specular, params); break;
 	default: break;
 	}
@@ -789,8 +815,8 @@ void glMaterialfv(GLenum face, GLenum pname, const GLfloat *params)
 void glFogf(GLenum pname, GLfloat param)
 {
 	switch (pname) {
-	case GL_FOG_START:  fog_start = param; break;
-	case GL_FOG_END:    fog_end = param; break;
+	case GL_FOG_START:  fog_start = param; fx_dirty = 1; break;
+	case GL_FOG_END:    fog_end = param; fx_dirty = 1; break;
 	default: break;        /* MODE/DENSITY: linear only */
 	}
 }
@@ -798,7 +824,7 @@ void glFogf(GLenum pname, GLfloat param)
 void glFogfv(GLenum pname, const GLfloat *params)
 {
 	if (pname == GL_AMBIENT)                /* abused as FOG_COLOR */
-		copy4(fog_color, params);
+		copy4(fog_color, params), fx_dirty = 1;
 }
 
 /* ---------------------------------------------------------------- queries */
@@ -849,24 +875,38 @@ void glRasterPos2i(GLint x, GLint y)     { (void)x; (void)y; }
 /* ------------------------------------------------------- immediate mode */
 
 #define MAX_VERTS 48
-#define W_EPS     0.0001f
+#define W_EPS_Q   6           /* near-plane clip threshold, Q16.16 (~0.0001) */
 
+/*
+ * All per-vertex data is kept in fixed point.  The R3000A has no FPU
+ * and every soft-float library call (fpmul/fpadd/...) costs hundreds
+ * of cycles, which made the float pipeline spend ~33k cycles per
+ * vertex.  Formats:
+ *   positions / clip coords / screen coords : Q16.16
+ *   normals                                  : Q2.14 (1.0 == 16384)
+ *   colours                                  : 0..255 bytes
+ * Texture coords stay float: they are only touched at packet-emit
+ * time, once per primitive, not per transformed vertex.
+ */
 typedef struct {
 	/* captured at glVertex/glColor/glNormal/glTexCoord time */
-	float x, y, z, w;
-	float r, g, b, a;
-	float u, v;
-	float nx, ny, nz;
+	int   x, y, z;          /* Q16.16 */
+	int   r8, g8, b8, a8;   /* 0..255 */
+	int   u, v;              /* texcoords, Q8.8 */
+	int   nx, ny, nz;       /* Q2.14 */
 	/* computed at glEnd: */
-	float c[4];          /* clip coordinates (x, y, z, w) */
-	float sx, sy;        /* screen coords, PSX top-left origin */
-	float dist;          /* clip w == eye distance (perspective) */
+	int   c[4];             /* clip coordinates (x, y, z, w), Q16.16 */
+	int   sx, sy;          /* screen coords, integer pixels */
+	int   dist;            /* clip w == eye distance, Q16.16 */
 } Vtx;
 
 static GLenum prim_mode;
 static int    prim_n;
 static Vtx    verts[MAX_VERTS];
 static int    in_begin;
+
+int f2q(float f, int bits);
+static int c2i(float f);
 
 void glBegin(GLenum mode)
 {
@@ -880,11 +920,6 @@ void glVertex2f(GLfloat x, GLfloat y)
 	glVertex3f(x, y, 0.0f);
 }
 
-void glVertex2i(GLint x, GLint y)
-{
-	glVertex3f((GLfloat)x, (GLfloat)y, 0.0f);
-}
-
 void glVertex3f(GLfloat x, GLfloat y, GLfloat z)
 {
 	Vtx *v;
@@ -892,16 +927,42 @@ void glVertex3f(GLfloat x, GLfloat y, GLfloat z)
 	if (!in_begin || prim_n >= MAX_VERTS)
 		return;
 	v = &verts[prim_n++];
-	v->x = x; v->y = y; v->z = z; v->w = 1.0f;
-	v->r = cur_color[0]; v->g = cur_color[1];
-	v->b = cur_color[2]; v->a = cur_color[3];
+	v->x = f2q(x, 16); v->y = f2q(y, 16); v->z = f2q(z, 16);
+	v->r8 = cur_color[0]; v->g8 = cur_color[1];
+	v->b8 = cur_color[2]; v->a8 = cur_color[3];
+	v->u = cur_uv[0];    v->v = cur_uv[1];
+	v->nx = cur_normal[0]; v->ny = cur_normal[1]; v->nz = cur_normal[2];
+}
+
+/* Integer vertex paths: the arena grid, floor tiles, walls and text
+ * quads are laid out in whole units, so the coordinates convert to
+ * Q16.16 with a plain shift — no float conversion needed. */
+void glVertex2i(GLint x, GLint y)
+{
+	Vtx *v;
+
+	if (!in_begin || prim_n >= MAX_VERTS)
+		return;
+	v = &verts[prim_n++];
+	v->x = x << 16; v->y = y << 16; v->z = 0;
+	v->r8 = cur_color[0]; v->g8 = cur_color[1];
+	v->b8 = cur_color[2]; v->a8 = cur_color[3];
 	v->u = cur_uv[0];    v->v = cur_uv[1];
 	v->nx = cur_normal[0]; v->ny = cur_normal[1]; v->nz = cur_normal[2];
 }
 
 void glVertex3i(GLint x, GLint y, GLint z)
 {
-	glVertex3f((GLfloat)x, (GLfloat)y, (GLfloat)z);
+	Vtx *v;
+
+	if (!in_begin || prim_n >= MAX_VERTS)
+		return;
+	v = &verts[prim_n++];
+	v->x = x << 16; v->y = y << 16; v->z = z << 16;
+	v->r8 = cur_color[0]; v->g8 = cur_color[1];
+	v->b8 = cur_color[2]; v->a8 = cur_color[3];
+	v->u = cur_uv[0];    v->v = cur_uv[1];
+	v->nx = cur_normal[0]; v->ny = cur_normal[1]; v->nz = cur_normal[2];
 }
 
 void glVertex3fv(const GLfloat *p)
@@ -911,21 +972,21 @@ void glVertex3fv(const GLfloat *p)
 
 void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 {
+	/* w is accepted but ignored: the transform assumes w == 1
+	 * (nothing in the port uses glVertex4f) */
+	(void)w;
 	glVertex3f(x, y, z);
-	if (prim_n > 0)
-		verts[prim_n - 1].w = w;
 }
 
 void glColor3f(GLfloat r, GLfloat g, GLfloat b)
 {
-	cur_color[0] = r; cur_color[1] = g; cur_color[2] = b;
-	cur_color[3] = 1.0f;
+	glColor4f(r, g, b, 1.0f);
 }
 
 void glColor4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
 {
-	cur_color[0] = r; cur_color[1] = g;
-	cur_color[2] = b; cur_color[3] = a;
+	cur_color[0] = c2i(r); cur_color[1] = c2i(g);
+	cur_color[2] = c2i(b); cur_color[3] = c2i(a);
 }
 
 void glColor3fv(const GLfloat *p)  { glColor3f(p[0], p[1], p[2]); }
@@ -933,23 +994,27 @@ void glColor4fv(const GLfloat *p) { glColor4f(p[0], p[1], p[2], p[3]); }
 
 void glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a)
 {
-	glColor4f((GLfloat)r / 255.0f, (GLfloat)g / 255.0f,
-		  (GLfloat)b / 255.0f, (GLfloat)a / 255.0f);
+	cur_color[0] = r; cur_color[1] = g;
+	cur_color[2] = b; cur_color[3] = a;
 }
 
 void glTexCoord2f(GLfloat u, GLfloat v)
 {
-	cur_uv[0] = u; cur_uv[1] = v;
+	cur_uv[0] = f2q(u, 8); cur_uv[1] = f2q(v, 8);
 }
 
 void glTexCoord2i(GLint u, GLint v)
 {
-	cur_uv[0] = (GLfloat)u; cur_uv[1] = (GLfloat)v;
+	cur_uv[0] = u << 8; cur_uv[1] = v << 8;
 }
 
 void glNormal3f(GLfloat x, GLfloat y, GLfloat z)
 {
-	cur_normal[0] = x; cur_normal[1] = y; cur_normal[2] = z;
+	int t;
+
+	t = f2q(x, 14); cur_normal[0] = (t > 16384) ? 16384 : (t < -16384 ? -16384 : t);
+	t = f2q(y, 14); cur_normal[1] = (t > 16384) ? 16384 : (t < -16384 ? -16384 : t);
+	t = f2q(z, 14); cur_normal[2] = (t > 16384) ? 16384 : (t < -16384 ? -16384 : t);
 }
 
 void glNormal3fv(const GLfloat *p)
@@ -958,13 +1023,6 @@ void glNormal3fv(const GLfloat *p)
 }
 
 /* ------------------------------------------- per-vertex pipeline stages */
-
-static int f2i(float f)          /* saturating float -> int */
-{
-	if (f <= 0.0f) return 0;
-	if (f >= 1023.0f) return 1023;
-	return (int)f;
-}
 
 static int c2i(float f)          /* float colour -> byte */
 {
@@ -975,114 +1033,258 @@ static int c2i(float f)          /* float colour -> byte */
 	return v;
 }
 
+/*
+ * float -> Q<bits> fixed point straight from the IEEE bits — no
+ * soft-float library calls.  Exact for the whole useful range of
+ * vertex coordinates; magnitudes above ~2^14 (positions) or 1
+ * (normals) saturate, and the emit stage clamps to the screen
+ * anyway.
+ */
+static int f2q(float f, int bits)
+{
+	union { float f; unsigned int i; } u;
+	int e, m, r;
+
+	u.f = f;
+	if ((u.i & 0x7fffffffu) == 0)
+		return 0;
+	e = (int)((u.i >> 23) & 0xff) - 127;         /* unbiased exponent */
+	m = (int)((u.i & 0x7fffffu) | 0x800000u);   /* 1.23 mantissa */
+	/* value = m * 2^(e-23); want m * 2^(e + bits - 23) */
+	e += bits - 23;
+	if (e >= 0) {
+		if (e > 7)
+			e = 7;             /* saturate: m<<7 is the last
+					     shift that stays in int32 */
+		r = m << e;
+	} else {
+		if (e < -31)
+			e = -31;
+		r = m >> -e;               /* tiny |f|: rounds toward 0 */
+	}
+	return (u.i & 0x80000000u) ? -r : r;
+}
+
+/* --------------------------------------------------- fixed point state */
+/*
+ * Float matrices/parameters are converted to fixed point lazily,
+ * once per glBegin at the latest, so the per-vertex inner loops
+ * never touch the soft-float library.
+ */
+static int  fx_mv[16];          /* Q16.16 modelview */
+static int  fx_proj[16];        /* Q16.16 projection */
+static int  fx_light_dir[3];    /* Q2.14, directional */
+static int  fx_lp[3];           /* Q16.16, positional light pos */
+static int  fx_amb8[3];         /* ambient * light, 0..255 */
+static int  fx_diff8[3];        /* diffuse * light, 0..255 */
+static int  fx_light_positional;
+static int  fx_fog_start, fx_fog_end, fx_fog_range;  /* Q16.16 */
+static long long fx_fog_inv;    /* 2^32 / range, for Q16 fog factor */
+static int  fx_fog_c8[3];       /* fog colour, 0..255 */
+
+static void fx_rebuild(void)
+{
+	int i;
+
+	for (i = 0; i < 16; i++) {
+		fx_mv[i]   = f2q(mv.m[i], 16);
+		fx_proj[i] = f2q(proj.m[i], 16);
+	}
+	for (i = 0; i < 3; i++) {
+		fx_light_dir[i] = f2q(light_dir[i], 14);
+		fx_lp[i]        = f2q(light_pos[i], 16);
+		fx_amb8[i]      = c2i(mat_ambient[i] * light_ambient[i]);
+		fx_diff8[i]     = c2i(mat_diffuse[i] * light_diffuse[i]);
+		fx_fog_c8[i]    = c2i(fog_color[i]);
+	}
+	fx_fog_start = f2q(fog_start, 16);
+	fx_fog_end   = f2q(fog_end, 16);
+	fx_fog_range = fx_fog_end - fx_fog_start;
+	fx_fog_inv   = (fx_fog_range > 0)
+			? (((long long)1 << 32) / fx_fog_range) : 0;
+	fx_light_positional = (light_pos[3] != 0.0f);
+	fx_dirty = 0;
+}
+
+/*
+ * Integer reciprocal: returns floor(2^30 / d) for d > 0.
+ *
+ * d is normalized into (2^30, 2^31], a linear seed is refined with
+ * three Newton steps for  1/x  (x in (0.5, 1], fixed point 2^30),
+ * then the normalization shift is folded back in.  All products fit
+ * in 64 bits; the intermediate y stays below 2^31.
+ */
+static unsigned fx_inv30(unsigned d)
+{
+	unsigned dn, y, t;
+	int k = 0;
+
+	dn = d;
+	while (dn <= (1u << 30)) {
+		dn <<= 1;
+		k++;
+	}
+	/* x = dn/2^31 in (0.5, 1];  y ~ (1/x) * 2^30 */
+	y = 3u * (1u << 30) - dn;                      /* (3 - 2x)*2^30 */
+	t = (unsigned)(((unsigned long long)dn * y) >> 31);
+	y = (unsigned)(((unsigned long long)y * ((2u << 30) - t)) >> 30);
+	t = (unsigned)(((unsigned long long)dn * y) >> 31);
+	y = (unsigned)(((unsigned long long)y * ((2u << 30) - t)) >> 30);
+	t = (unsigned)(((unsigned long long)dn * y) >> 31);
+	y = (unsigned)(((unsigned long long)y * ((2u << 30) - t)) >> 30);
+	/* y = 2^61/dn  =>  2^30/d = y * 2^k / 2^31 */
+	return (unsigned)((((unsigned long long)y << k) >> 31));
+}
+
+/* integer sqrt (positional-light path only; rare and not hot) */
+static int fx_isqrt(long long v)
+{
+	long long x;
+	int i;
+
+	if (v <= 0)
+		return 0;
+	x = 1;
+	for (i = 0; i < 32; i++) {
+		if ((x << (2 * i + 2)) > v)
+			break;
+		x <<= 1;
+	}
+	for (i = 0; i < 6; i++)
+		x = (x + v / x) / 2;          /* Newton, converges from above */
+	return (int)x;
+}
+
 /* Map clip coordinates to screen; called once the clip w is known
  * positive.  Fills sx, sy, dist. */
 static void project_vtx(Vtx *v)
 {
-	float inv = 1.0f / v->c[3];
-	float ndc_x = v->c[0] * inv;
-	float ndc_y = v->c[1] * inv;
+	unsigned inv = fx_inv30((unsigned)v->c[3]);
+	int ndc_x = (int)(((long long)v->c[0] * (int)inv) >> 14);
+	int ndc_y = (int)(((long long)v->c[1] * (int)inv) >> 14);
+	int half_w = vp_w >> 1;
+	int half_h = vp_h >> 1;
 
-	v->sx = (float)vp_x + (ndc_x * 0.5f + 0.5f) * (float)vp_w;
-	v->sy = (float)vp_y + (float)vp_h -
-		(ndc_y * 0.5f + 0.5f) * (float)vp_h;
+	/* clamp degenerate ratios before the screen map (the emit
+	 * stage saturates anyway; this keeps the int32 math sane) */
+	if (ndc_x > 4 * 65536) ndc_x = 4 * 65536;
+	if (ndc_x < -4 * 65536) ndc_x = -4 * 65536;
+	if (ndc_y > 4 * 65536) ndc_y = 4 * 65536;
+	if (ndc_y < -4 * 65536) ndc_y = -4 * 65536;
+
+	v->sx = vp_x + (int)(((long long)(ndc_x + 65536) * half_w
+			     + 32768) >> 16);
+	v->sy = vp_y + vp_h - (int)(((long long)(ndc_y + 65536) * half_h
+				     + 32768) >> 16);
 	v->dist = v->c[3];
 }
 
 /* Transform one accumulated vertex: modelview, lighting, fog,
- * projection (clip coords cached in v->c). */
+ * projection — all in Q16.16 fixed point. */
 static void transform_vertex(Vtx *v)
 {
-	float ex, ey, ez, ew;
+	const int *m = fx_mv;
+	long long t;
+	int ex, ey, ez;
 
-	ex = mv.m[0] * v->x + mv.m[4] * v->y + mv.m[8]  * v->z + mv.m[12];
-	ey = mv.m[1] * v->x + mv.m[5] * v->y + mv.m[9]  * v->z + mv.m[13];
-	ez = mv.m[2] * v->x + mv.m[6] * v->y + mv.m[10] * v->z + mv.m[14];
-	ew = mv.m[3] * v->x + mv.m[7] * v->y + mv.m[11] * v->z + mv.m[15];
-	(void)ew;
+	t  = (long long)m[0] * v->x + (long long)m[4] * v->y +
+	     (long long)m[8] * v->z;
+	ex = (int)(t >> 16) + m[12];
+	t  = (long long)m[1] * v->x + (long long)m[5] * v->y +
+	     (long long)m[9] * v->z;
+	ey = (int)(t >> 16) + m[13];
+	t  = (long long)m[2] * v->x + (long long)m[6] * v->y +
+	     (long long)m[10] * v->z;
+	ez = (int)(t >> 16) + m[14];
 
-	/* lighting: one light, ambient + diffuse, in eye space */
+	/* lighting: one light, ambient + diffuse, in eye space.
+	 * Normals must be unit vectors (as OBJ exports them); the
+	 * Q2.14 x Q16.16 products then cannot overflow int32. */
 	if (st_lighting && light0_on) {
-		float nx, ny, nz, lx, ly, lz, nd;
+		int nx = (m[0] * v->nx + m[4] * v->ny + m[8] * v->nz) >> 16;
+		int ny = (m[1] * v->nx + m[5] * v->ny + m[9] * v->nz) >> 16;
+		int nz = (m[2] * v->nx + m[6] * v->ny + m[10] * v->nz) >> 16;
+		int lx, ly, lz, nd;
 
-		nx = mv.m[0] * v->nx + mv.m[4] * v->ny + mv.m[8]  * v->nz;
-		ny = mv.m[1] * v->nx + mv.m[5] * v->ny + mv.m[9]  * v->nz;
-		nz = mv.m[2] * v->nx + mv.m[6] * v->ny + mv.m[10] * v->nz;
-
-		if (light_pos[3] == 0.0f) {
-			/* directional light: direction precomputed once in
-			 * glLightfv (light_dir) — no per-vertex sqrt */
-			lx = light_dir[0];
-			ly = light_dir[1];
-			lz = light_dir[2];
+		if (!fx_light_positional) {
+			lx = fx_light_dir[0];
+			ly = fx_light_dir[1];
+			lz = fx_light_dir[2];
 		} else {
-			float px = light_pos[0] / light_pos[3];
-			float py = light_pos[1] / light_pos[3];
-			float pz = light_pos[2] / light_pos[3];
-			float dx = ex - px, dy = ey - py, dz = ez - pz;
-			float len = (float)sqrt((double)(
-				dx * dx + dy * dy + dz * dz));
+			long long dx = fx_lp[0] - ex;   /* Q16.16 */
+			long long dy = fx_lp[1] - ey;
+			long long dz = fx_lp[2] - ez;
+			long long len = fx_isqrt(dx * dx + dy * dy + dz * dz);
+			unsigned inv;
 
-			if (len > 0.0f) {
-				float inv = 1.0f / len;
-
-				lx = dx * inv; ly = dy * inv; lz = dz * inv;
-			} else {
-				lx = 0.0f; ly = 0.0f; lz = -1.0f;
-			}
+			if (len < 65536)
+				len = 65536;
+			inv = fx_inv30((unsigned)(len >> 16));
+			lx = (int)((dx * inv) >> 16);
+			ly = (int)((dy * inv) >> 16);
+			lz = (int)((dz * inv) >> 16);
 		}
 
-		nd = nx * lx + ny * ly + nz * lz;
-		if (nd < 0.0f)
-			nd = 0.0f;
-
-		v->r = mat_ambient[0] * light_ambient[0] +
-		       mat_diffuse[0] * light_diffuse[0] * nd;
-		v->g = mat_ambient[1] * light_ambient[1] +
-		       mat_diffuse[1] * light_diffuse[1] * nd;
-		v->b = mat_ambient[2] * light_ambient[2] +
-		       mat_diffuse[2] * light_diffuse[2] * nd;
-		v->a = mat_diffuse[3];
+		nd = (nx * lx + ny * ly + nz * lz) >> 14;
+		if (nd < 0)
+			nd = 0;
+		v->r8 = fx_amb8[0] + ((fx_diff8[0] * nd) >> 14);
+		if (v->r8 > 255) v->r8 = 255;
+		v->g8 = fx_amb8[1] + ((fx_diff8[1] * nd) >> 14);
+		if (v->g8 > 255) v->g8 = 255;
+		v->b8 = fx_amb8[2] + ((fx_diff8[2] * nd) >> 14);
+		if (v->b8 > 255) v->b8 = 255;
 	}
 
 	/* linear fog toward fog_color (eye distance = -ez) */
-	if (st_fog && fog_end > fog_start) {
-		float d = -ez;
-		float f = (fog_end - d) / (fog_end - fog_start);
+	if (st_fog && fx_fog_range > 0) {
+		int d = -ez;
+		int f = (int)(((long long)(fx_fog_end - d) * fx_fog_inv)
+				>> 16);
 
-		if (f < 0.0f) f = 0.0f;
-		if (f > 1.0f) f = 1.0f;
-		v->r = v->r * f + fog_color[0] * (1.0f - f);
-		v->g = v->g * f + fog_color[1] * (1.0f - f);
-		v->b = v->b * f + fog_color[2] * (1.0f - f);
+		if (f < 0) f = 0;
+		if (f > 65536) f = 65536;
+		v->r8 = v->r8 + (((fx_fog_c8[0] - v->r8) * f) >> 16);
+		v->g8 = v->g8 + (((fx_fog_c8[1] - v->g8) * f) >> 16);
+		v->b8 = v->b8 + (((fx_fog_c8[2] - v->b8) * f) >> 16);
 	}
 
-	/* projection -> clip coords */
-	v->c[0] = proj.m[0] * ex + proj.m[4] * ey +
-		  proj.m[8]  * ez + proj.m[12];
-	v->c[1] = proj.m[1] * ex + proj.m[5] * ey +
-		  proj.m[9]  * ez + proj.m[13];
-	v->c[2] = proj.m[2] * ex + proj.m[6] * ey +
-		  proj.m[10] * ez + proj.m[14];
-	v->c[3] = proj.m[3] * ex + proj.m[7] * ey +
-		  proj.m[11] * ez + proj.m[15];
+	/* projection -> clip coords (Q16.16) */
+	t  = (long long)fx_proj[0] * ex + (long long)fx_proj[4] * ey +
+	     (long long)fx_proj[8] * ez + fx_proj[12];
+	v->c[0] = (int)(t >> 16);
+	t  = (long long)fx_proj[1] * ex + (long long)fx_proj[5] * ey +
+	     (long long)fx_proj[9] * ez + fx_proj[13];
+	v->c[1] = (int)(t >> 16);
+	t  = (long long)fx_proj[2] * ex + (long long)fx_proj[6] * ey +
+	     (long long)fx_proj[10] * ez + fx_proj[14];
+	v->c[2] = (int)(t >> 16);
+	t  = (long long)fx_proj[3] * ex + (long long)fx_proj[7] * ey +
+	     (long long)fx_proj[11] * ez + fx_proj[15];
+	v->c[3] = (int)(t >> 16);
 
-	if (v->c[3] > W_EPS)
+	if (v->c[3] > W_EPS_Q)
 		project_vtx(v);
 	else
-		v->dist = 0.0f;    /* behind the eye; clipper decides */
+		v->dist = 0;             /* behind the eye; clipper decides */
 }
 
 /* ------------------------------------------- primitive packet emission */
 
 static u32 xy_word(const Vtx *v)
 {
-	return ((u32)f2i(v->sy) << 16) | (u32)f2i(v->sx);
+	int x = v->sx, y = v->sy;
+
+	if (x < 0) x = 0;
+	if (x > 1023) x = 1023;
+	if (y < 0) y = 0;
+	if (y > 1023) y = 1023;
+	return ((u32)y << 16) | (u32)x;
 }
 
 static u32 col_word(const Vtx *v)
 {
-	return (u32)(c2i(v->r) | (c2i(v->g) << 8) | (c2i(v->b) << 16));
+	return (u32)(v->r8 | (v->g8 << 8) | (v->b8 << 16));
 }
 
 static u32 uv_word(const Vtx *v)
@@ -1090,8 +1292,8 @@ static u32 uv_word(const Vtx *v)
 	int u, vv;
 
 	if (bound_tex) {
-		u  = (int)(v->u * (float)bound_tex->w) & 0xFF;
-		vv = (int)(v->v * (float)bound_tex->h) & 0xFF;
+		u  = ((v->u * bound_tex->w) >> 8) & 0xFF;
+		vv = ((v->v * bound_tex->h) >> 8) & 0xFF;
 	} else {
 		u = 0; vv = 0;
 	}
@@ -1101,13 +1303,16 @@ static u32 uv_word(const Vtx *v)
 static int depth_bucket(const Vtx *a, const Vtx *b,
 			const Vtx *c, const Vtx *d)
 {
-	float dist;
+	int dist, bucket;
 
 	if (d)
-		dist = (a->dist + b->dist + c->dist + d->dist) * 0.25f;
+		dist = (a->dist + b->dist + c->dist + d->dist) >> 2;
 	else
-		dist = (a->dist + b->dist + c->dist) / 3.0f;
-	return f2i(dist * (float)OT_SIZE / 256.0f);
+		dist = (a->dist + b->dist + c->dist) / 3;
+	bucket = (dist >> 16) << 2;      /* eye-units * OT_SIZE/256 */
+	if (bucket < 0) bucket = 0;
+	if (bucket >= OT_SIZE) bucket = OT_SIZE - 1;
+	return bucket;
 }
 
 static void emit_packet(u_long *pk, int n, const Vtx *const *vp, int nv)
@@ -1244,24 +1449,25 @@ static void emit_line(const Vtx *a, const Vtx *b)
 
 /* ------------------------------------------------ near-plane clipping */
 
-static void clip_lerp(Vtx *out, const Vtx *a, const Vtx *b, float t)
+static void clip_lerp(Vtx *out, const Vtx *a, const Vtx *b, int t)
 {
 	int i;
 
 	for (i = 0; i < 4; i++)
-		out->c[i] = a->c[i] + (b->c[i] - a->c[i]) * t;
-	out->r = a->r + (b->r - a->r) * t;
-	out->g = a->g + (b->g - a->g) * t;
-	out->b = a->b + (b->b - a->b) * t;
-	out->a = a->a + (b->a - a->a) * t;
-	out->u = a->u + (b->u - a->u) * t;
-	out->v = a->v + (b->v - a->v) * t;
+		out->c[i] = a->c[i] +
+			(int)(((long long)(b->c[i] - a->c[i]) * t) >> 16);
+	out->r8 = a->r8 + (((b->r8 - a->r8) * t) >> 16);
+	out->g8 = a->g8 + (((b->g8 - a->g8) * t) >> 16);
+	out->b8 = a->b8 + (((b->b8 - a->b8) * t) >> 16);
+	out->a8 = a->a8 + (((b->a8 - a->a8) * t) >> 16);
+	out->u = a->u + (((b->u - a->u) * t) >> 16);
+	out->v = a->v + (((b->v - a->v) * t) >> 16);
 
 	/* screen position from the clipped clip-coords */
-	if (out->c[3] > W_EPS)
+	if (out->c[3] > W_EPS_Q)
 		project_vtx(out);
 	else
-		out->dist = 0.0f;
+		out->dist = 0;
 }
 
 /*
@@ -1288,7 +1494,7 @@ static int clip_near(Vtx *v, int n)
 	 * output buffer below silently truncated every larger
 	 * fan/strip (Tux lost his belly, GLTron its trails). */
 	for (i = 0; i < n; i++)
-		if (v[i].c[3] <= W_EPS)
+		if (v[i].c[3] <= W_EPS_Q)
 			break;
 	if (i == n)
 		return n;
@@ -1296,16 +1502,19 @@ static int clip_near(Vtx *v, int n)
 	for (i = 0; i < n; i++) {
 		const Vtx *a = &v[i];
 		const Vtx *b = &v[(i + 1) % n];
-		int ain = a->c[3] > W_EPS;
-		int bin = b->c[3] > W_EPS;
+		int ain = a->c[3] > W_EPS_Q;
+		int bin = b->c[3] > W_EPS_Q;
 
 		if (ain) {
 			out[m++] = *a;
 			if (m >= MAX_VERTS) break;
 		}
 		if (ain != bin) {
-			float t = (a->c[3] - W_EPS) /
-				  (a->c[3] - b->c[3]);
+			/* t = (a.w - eps) / (a.w - b.w), Q16.16;
+			 * a is inside (w > eps) and b outside, so the
+			 * denominator is positive */
+			int t = (int)(((long long)(a->c[3] - W_EPS_Q) << 16)
+				      / (a->c[3] - b->c[3]));
 
 			clip_lerp(&out[m], a, b, t);
 			m++;
@@ -1331,6 +1540,11 @@ void glEnd(void)
 	in_begin = 0;
 	if (prim_n == 0)
 		return;
+
+	/* stage 0: refresh the fixed-point matrices/coefficients if
+	 * any matrix, light, material or fog parameter changed */
+	if (fx_dirty)
+		fx_rebuild();
 
 	/* stage 1: transform every accumulated vertex */
 	for (i = 0; i < prim_n; i++)
