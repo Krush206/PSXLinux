@@ -35,7 +35,7 @@ void initMainGameSettings(char *filename)
   game->settings->turn_cycle = 1;
   game->settings->line_spacing = 20;
   game->settings->erase_crashed = 0;
-  game->settings->fast_finish = 1;
+  game->settings->fast_finish = 0;
   game->settings->fov = 105;
   game->settings->speed = 4.2f;
   game->settings->width = 320;        /* PSX screen */
