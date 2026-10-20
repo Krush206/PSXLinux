@@ -36,9 +36,14 @@
 #include <linux/major.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/stat.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <asm/ps/hwregs.h>
+
+#ifdef CONFIG_DEVFS_FS
+#include <linux/devfs_fs_kernel.h>
+#endif
 
 #include <linux/psxspu.h>
 
@@ -228,6 +233,13 @@ int __init psxspu_init(void)
 		printk(KERN_ERR "psxspu: can't get major %d\n", PSXSPU_MAJOR);
 		return ret;
 	}
+
+#ifdef CONFIG_DEVFS_FS
+	devfs_register(NULL, "psxspu", DEVFS_FL_DEFAULT,
+		       PSXSPU_MAJOR, 0,
+		       S_IFCHR | S_IRUSR | S_IWUSR,
+		       &psxspu_fops, NULL);
+#endif
 
 	/* silence all voices at boot */
 	for (i = 0; i < 24; i++) {
