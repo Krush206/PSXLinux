@@ -476,7 +476,14 @@ static void build_sin_table(void)
 		float x = (float)i * (two_pi / (float)SIN_TABLE_SIZE);
 		sin_table[i] = taylor_sin(x);
 	}
-	for (i = SIN_TABLE_QUARTER; i < SIN_TABLE_SIZE / 2; i++)
+	/* The mirror loop at i == SIN_TABLE_QUARTER reads
+	 * sin_table[SIZE/2 - SIZE/4] == sin_table[i] — itself — which
+	 * leaves the BSS zero in place: sin(pi/2) returns 0.0 and, via
+	 * the half-table mirror, sin(3pi/2) too.  cos(x) = sin(x+pi/2)
+	 * then returns 0.0 for x == 0 and pi.  Set the quarter-point
+	 * entry explicitly and mirror the rest. */
+	sin_table[SIN_TABLE_QUARTER] = 1.0f;
+	for (i = SIN_TABLE_QUARTER + 1; i < SIN_TABLE_SIZE / 2; i++)
 		sin_table[i] = sin_table[SIN_TABLE_SIZE / 2 - i];
 	for (i = SIN_TABLE_SIZE / 2; i < SIN_TABLE_SIZE; i++)
 		sin_table[i] = -sin_table[i - SIN_TABLE_SIZE / 2];
