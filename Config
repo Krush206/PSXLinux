@@ -51,11 +51,10 @@ CONFIG_MIPS_FPU_EMULATOR=y
 # CONFIG_SYSVIPC is not set
 # CONFIG_BSD_PROCESS_ACCT is not set
 # CONFIG_SYSCTL is not set
-# CONFIG_KCORE_ELF is not set
-CONFIG_KCORE_AOUT=y
-CONFIG_BINFMT_FLAT=y
+# CONFIG_BINFMT_FLAT is not set
 # CONFIG_BINFMT_FLAT_SEPARATELY is not set
 # CONFIG_BINFMT_AOUT is not set
+CONFIG_BINFMT_ECOFF=y
 # CONFIG_BINFMT_ELF is not set
 # CONFIG_BINFMT_MISC is not set
 # CONFIG_NET is not set
@@ -75,16 +74,33 @@ CONFIG_BINFMT_FLAT=y
 # Block devices
 #
 # CONFIG_BLK_DEV_FD is not set
+# CONFIG_BLK_DEV_XD is not set
+# CONFIG_PARIDE is not set
+# CONFIG_BLK_CPQ_DA is not set
+# CONFIG_BLK_CPQ_CISS_DA is not set
+# CONFIG_BLK_DEV_DAC960 is not set
 # CONFIG_BLK_DEV_LOOP is not set
+# CONFIG_BLK_DEV_NBD is not set
 # CONFIG_BLK_DEV_RAM is not set
+# CONFIG_BLK_DEV_INITRD is not set
 # CONFIG_BLK_DEV_BLKMEM is not set
 CONFIG_PSX_MEM_CARD=y
+CONFIG_PSX_CDROM=y
+CONFIG_PSX_GPU=y
+CONFIG_PSX_SPU=y
 # CONFIG_PSX_LARGE_CARD is not set
 
 #
 # Multi-device support (RAID and LVM)
 #
 # CONFIG_MD is not set
+# CONFIG_BLK_DEV_MD is not set
+# CONFIG_MD_LINEAR is not set
+# CONFIG_MD_RAID0 is not set
+# CONFIG_MD_RAID1 is not set
+# CONFIG_MD_RAID5 is not set
+# CONFIG_BLK_DEV_LVM is not set
+# CONFIG_LVM_PROC_FS is not set
 
 #
 # ATA/IDE/MFM/RLL support
@@ -113,26 +129,39 @@ CONFIG_PSX_MEM_CARD=y
 # CONFIG_AUTOFS_FS is not set
 # CONFIG_AUTOFS4_FS is not set
 # CONFIG_ADFS_FS is not set
+# CONFIG_ADFS_FS_RW is not set
 # CONFIG_AFFS_FS is not set
 # CONFIG_HFS_FS is not set
 # CONFIG_BFS_FS is not set
 # CONFIG_FAT_FS is not set
+# CONFIG_MSDOS_FS is not set
+# CONFIG_UMSDOS_FS is not set
+# CONFIG_VFAT_FS is not set
 # CONFIG_EFS_FS is not set
+# CONFIG_JFFS_FS is not set
 # CONFIG_CRAMFS is not set
 # CONFIG_RAMFS is not set
-# CONFIG_ISO9660_FS is not set
+CONFIG_ISO9660_FS=y
+# CONFIG_JOLIET is not set
 # CONFIG_MINIX_FS is not set
 # CONFIG_NTFS_FS is not set
+# CONFIG_NTFS_RW is not set
 # CONFIG_HPFS_FS is not set
-CONFIG_PROC_FS=y
-# CONFIG_DEVFS_FS is not set
+# CONFIG_PROC_FS is not set
+CONFIG_DEVFS_FS=y
+CONFIG_DEVFS_MOUNT=y
+# CONFIG_DEVFS_DEBUG is not set
 # CONFIG_DEVPTS_FS is not set
 # CONFIG_QNX4FS_FS is not set
+# CONFIG_QNX4FS_RW is not set
 # CONFIG_ROMFS_FS is not set
 CONFIG_EXT2_FS=y
 # CONFIG_SYSV_FS is not set
+# CONFIG_SYSV_FS_WRITE is not set
 # CONFIG_UDF_FS is not set
+# CONFIG_UDF_RW is not set
 # CONFIG_UFS_FS is not set
+# CONFIG_UFS_FS_WRITE is not set
 # CONFIG_NCPFS_NLS is not set
 # CONFIG_SMB_FS is not set
 
@@ -147,11 +176,9 @@ CONFIG_MSDOS_PARTITION=y
 #
 # Console drivers
 #
-CONFIG_GPUPSX_CONSOLE=y
-CONFIG_PC_KEYB=y
-CONFIG_VT=y
-CONFIG_VT_CONSOLE_HIRES=y
-CONFIG_VT_CONSOLE=y
+# CONFIG_GPUPSX_CONSOLE is not set
+# CONFIG_PC_KEYB is not set
+# CONFIG_VT is not set
 CONFIG_SERIAL_PSX=y
 CONFIG_SERIAL_PSX_CONSOLE=y
 VT_SINGLE_DRIVER=y
@@ -177,3 +204,4 @@ VT_SINGLE_DRIVER=y
 CONFIG_CROSSCOMPILE=y
 # CONFIG_MAGIC_SYSRQ is not set
 # CONFIG_MIPS_UNCACHED is not set
+# CONFIG_PLAYSTATION_LIBPS is not set
