@@ -213,10 +213,10 @@ static void dispatch_keys(void)
 	dispatch_key(BTN_STA,    27,  0);        /* back / quit to gui */
 	dispatch_key(BTN_UP,     GLUT_KEY_UP,    1);
 	dispatch_key(BTN_DOWN,   GLUT_KEY_DOWN,  1);
-	dispatch_key(BTN_TRI,    GLUT_KEY_F1,    1);
-	dispatch_key(BTN_CIR,    GLUT_KEY_F2,    1);
-	dispatch_key(BTN_SQU,    GLUT_KEY_F3,    1);
-	dispatch_key(BTN_L1,     GLUT_KEY_F10,   1);  /* cycle camera */
+	/* NOTE: triangle/circle/square deliberately not bound — an
+	 * idle physical joystick in the emulator can report them
+	 * held, and F1/F2/F3 would switch the display to 2- or
+	 * 4-view mode at startup, quadrupling the render load. */
 }
 
 /* ----------------------------------------------------------------- loop */
