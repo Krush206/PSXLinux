@@ -23,7 +23,6 @@ void drawGame() {
   GLint i;
   gDisplay *d;
   Player *p;
-
   polycount = 0;
   glClearColor(.0, .0, .0, .0);
   glDepthMask(GL_TRUE);
