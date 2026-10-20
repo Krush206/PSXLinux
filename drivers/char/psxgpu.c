@@ -38,8 +38,13 @@
 #include <linux/major.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/stat.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
+
+#ifdef CONFIG_DEVFS_FS
+#include <linux/devfs_fs_kernel.h>
+#endif
 
 #include <linux/psxgpu.h>
 
@@ -203,6 +208,8 @@ static int psxgpu_ioctl(struct inode *inode, struct file *filp,
 			if (!xf.w || !xf.h || !xf.data)
 				return -EINVAL;
 
+
+
 			/* GP0(A0h): command, dest coord, width/height.
 			 * The GPU masks (size-1)+1 internally, so raw
 			 * w/h are passed (same as the plugin expects). */
@@ -275,6 +282,15 @@ int __init psxgpu_init(void)
 		printk(KERN_ERR "psxgpu: can't get major %d\n", PSXGPU_MAJOR);
 		return ret;
 	}
+
+#ifdef CONFIG_DEVFS_FS
+	/* with devfs the node appears automatically (an ISO9660 root
+	 * cannot hold device nodes) */
+	devfs_register(NULL, "psxgpu", DEVFS_FL_DEFAULT,
+		       PSXGPU_MAJOR, 0,
+		       S_IFCHR | S_IRUSR | S_IWUSR,
+		       &psxgpu_fops, NULL);
+#endif
 
 	printk(KERN_INFO "psxgpu: PSX GPU device, major %d\n", PSXGPU_MAJOR);
 	return 0;
