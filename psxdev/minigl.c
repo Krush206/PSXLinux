@@ -166,15 +166,16 @@ static void show_buffer(int idx)
 #define OT_BITS 10
 #define OT_SIZE (1 << OT_BITS)
 /*
- * Packet arena.  A frame builds ~360 packets of 4..9 words (~2.5k
- * words); 8k words is a generous ceiling.  The arena is BSS and the
+ * Packet arena.  A frame builds ~800 packets of 4..12 words
+ * (floor grid ~440 quads, wall segments, trails, bikes, HUD);
+ * 12k words is a generous ceiling.  The arena is BSS and the
  * user-program image must stay below ~0x1AA0A0 so the 24K stack
  * top (image end + 0x6000) fits inside the kernel's 0x1B0000
  * reservation — the old 24k-word arena alone blew that budget by
  * pushing the stack into memory the boot allocator had given away
  * (the symptom was a dead /dev/psxgpu: all-black frames).
  */
-#define ARENA_WORDS 8192
+#define ARENA_WORDS 12288
 
 static u_long  ot[2][OT_SIZE];   /* linked-list heads, one per buffer */
 static u_long  pkt_arena[ARENA_WORDS];
@@ -189,15 +190,18 @@ static void ot_reset(int buff)
 	pkt_top = pkt_arena;
 }
 
+/* Packet layout: p[0] = OT link, p[1] = word count, p[2] = texture
+ * window word (GP0(E2h), 0 = leave the window alone), p[3..] = the
+ * GP0 primitive words. */
 static u_long *pkt_new(int words)
 {
 	u_long *p;
 
-	if (pkt_top + words + 2 >= pkt_arena + ARENA_WORDS)
+	if (pkt_top + words + 3 >= pkt_arena + ARENA_WORDS)
 		return 0;
 	p = pkt_top;
 	p[1] = words;
-	pkt_top += words + 2;
+	pkt_top += words + 3;
 	return p;
 }
 
@@ -213,14 +217,24 @@ static void pkt_link(int buff, int bucket, u_long *node)
 
 static void ot_emit(int buff)
 {
+	/* The GPU's texture window is global state; each packet says
+	 * which window it needs and we emit the E2h only when it
+	 * changes while draining the table. */
+	static u32 last_twin = 0xffffffffu;
 	int i;
 
 	for (i = OT_SIZE - 1; i >= 0; i--) {
 		u_long *p;
 		for (p = (u_long *)ot[buff][i]; p; p = (u_long *)p[0]) {
 			int n = (int)p[1], j;
+			u32 twin = (u32)p[2];
+
+			if (twin != 0 && twin != last_twin) {
+				gp0_send(twin);
+				last_twin = twin;
+			}
 			for (j = 0; j < n; j++)
-				gp0_send((u32)p[2 + j]);
+				gp0_send((u32)p[3 + j]);
 		}
 	}
 }
@@ -503,6 +517,7 @@ typedef struct {
 	int w, h;
 	int vram_x, vram_y;         /* top-left in VRAM halfwords */
 	u16 tpage_bits;              /* tpage field for the TSB word */
+	u32 twin_word;               /* GP0(E2h) texture-window word for this tex */
 	int wrap_s, wrap_t;          /* GL_REPEAT / GL_CLAMP */
 } Tex;
 
@@ -563,25 +578,35 @@ void glBindTexture(GLenum target, GLuint id)
 	if (id < MAX_TEX && texs[id].used) {
 		bound_tex = &texs[id];
 		t = bound_tex;
-		/* Texture window (GP0(E2h)): GL_REPEAT wraps UVs within the
-		 * texture.  The E2h mask fields are in 8-pixel steps, so the
-		 * tiling code maps the power-of-two size; GL_CLAMP passes
-		 * UVs through unchanged (mask = all bits).
-		 * NB: this is E2h, NOT E6h - E6h is the mask-bit setting
-		 * ("reject pixels with bit15 set"), which breaks drawing. */
+		/* Texture window (GP0(E2h)): the word is NOT sent here.
+		 * Primitives go into the ordering table and are drained
+		 * by ot_emit() at swap time, so an E2 written at bind
+		 * time would take effect before this frame's packets -
+		 * i.e. every quad would render under the window of
+		 * whichever texture was bound LAST.  Instead every
+		 * textured packet carries its texture's window word in
+		 * its header and ot_emit() emits it on change.
+		 *
+		 * GL_REPEAT maps the power-of-two size; the E2h mask
+		 * fields are in 8-pixel steps (mask value v wraps UVs
+		 * at v*8 texels).  GL_CLAMP leaves the fields zero:
+		 * mask 0 = window off, UVs pass through unchanged.
+		 * NB: this is E2h, NOT E6h - E6h is the mask-bit
+		 * setting ("reject pixels with bit15 set"), which
+		 * breaks drawing. */
 		if (t->wrap_s == GL_REPEAT)
 			mx = (t->w <= 8) ? 31 : (t->w <= 16) ? 30 :
 			      (t->w <= 32) ? 28 : (t->w <= 64) ? 24 :
 			      (t->w <= 128) ? 16 : 0;
 		else
-			mx = 31;
+			mx = 0;
 		if (t->wrap_t == GL_REPEAT)
 			my = (t->h <= 8) ? 31 : (t->h <= 16) ? 30 :
 			      (t->h <= 32) ? 28 : (t->h <= 64) ? 24 :
 			      (t->h <= 128) ? 16 : 0;
 		else
-			my = 31;
-			gp0_send(0xE2000000u | mx | (my << 5));
+			my = 0;
+		t->twin_word = 0xE2000000u | mx | (my << 5);
 	} else {
 		bound_tex = 0;
 	}
@@ -1293,17 +1318,51 @@ static u32 col_word(const Vtx *v)
 	return (u32)(v->r8 | (v->g8 << 8) | (v->b8 << 16));
 }
 
-static u32 uv_word(const Vtx *v)
+/* Phase-correct UV bytes for one textured primitive.
+ *
+ * The PSX UV field is 8 bits, but the texture window (GP0(E2h))
+ * wraps sampling at the texture size, so only u mod w survives
+ * rasterization.  A primitive whose coordinates cross the 256-byte
+ * wrap would fold over: vertices at 192 and 256(=0) interpolate
+ * backwards through the texture.  Instead remap each primitive's
+ * bytes to start at the phase of its minimum vertex and grow by
+ * the true span:  byte_i = (umin mod w) + (u_i - umin).  With
+ * w <= 64 and spans of up to ~2.9 repeats every byte stays in
+ * 0..255 and the per-pixel window wrap reproduces the exact
+ * texels - which frees the game to subdivide tiling geometry at
+ * any boundary it likes.  GL_CLAMP textures (the font sheet) keep
+ * the raw bytes: their window is off, so the byte IS the texel
+ * offset within the sheet. */
+static void prim_uv_bytes(const Vtx *const *vp, int nv, u32 *out)
 {
-	int u, vv;
+	int uf[4], vf[4];
+	int um, vm, bu, bv, i;
 
-	if (bound_tex) {
-		u  = ((v->u * bound_tex->w) >> 8) & 0xFF;
-		vv = ((v->v * bound_tex->h) >> 8) & 0xFF;
-	} else {
-		u = 0; vv = 0;
+	for (i = 0; i < nv; i++) {
+		uf[i] = (vp[i]->u * bound_tex->w) >> 8;
+		vf[i] = (vp[i]->v * bound_tex->h) >> 8;
 	}
-	return (u32)u | ((u32)vv << 8);
+	um = uf[0];
+	vm = vf[0];
+	for (i = 1; i < nv; i++) {
+		if (uf[i] < um) um = uf[i];
+		if (vf[i] < vm) vm = vf[i];
+	}
+	bu = (bound_tex->wrap_s == GL_REPEAT) ? um % bound_tex->w : 0;
+	bv = (bound_tex->wrap_t == GL_REPEAT) ? vm % bound_tex->h : 0;
+	for (i = 0; i < nv; i++) {
+		int b_u, b_v;
+
+		if (bound_tex->wrap_s == GL_REPEAT)
+			b_u = bu + uf[i] - um;
+		else
+			b_u = uf[i] & 0xFF;
+		if (bound_tex->wrap_t == GL_REPEAT)
+			b_v = bv + vf[i] - vm;
+		else
+			b_v = vf[i] & 0xFF;
+		out[i] = (u32)b_u | ((u32)b_v << 8);
+	}
 }
 
 static int depth_bucket(const Vtx *a, const Vtx *b,
@@ -1321,12 +1380,13 @@ static int depth_bucket(const Vtx *a, const Vtx *b,
 	return bucket;
 }
 
-static void emit_packet(u_long *pk, int n, const Vtx *const *vp, int nv)
+static void emit_packet(u_long *pk, u32 twin, int n, const Vtx *const *vp, int nv)
 {
 	int bucket = depth_bucket(vp[0], vp[1],
 				  nv > 2 ? vp[2] : vp[1], vp[3]);
 
 	pk[1] = n;
+	pk[2] = twin;
 	pkt_link(active_buff ^ 1, bucket, pk);
 }
 
@@ -1341,6 +1401,7 @@ static void emit_tri(const Vtx *a, const Vtx *b, const Vtx *c)
 
 	if (st_texture_2d && bound_tex) {
 		u32 tsb = (u32)bound_tex->tpage_bits;
+		u32 uvb[3];
 		const Vtx *vp[3];
 
 		/* semi-transparency = ABE = command bit 25, i.e. +2 in
@@ -1349,17 +1410,18 @@ static void emit_tri(const Vtx *a, const Vtx *b, const Vtx *c)
 		pk = pkt_new(gouraud ? 9 : 7);
 		if (!pk)
 			return;
-		pk[2 + n++] = cmd | col_word(a);
-		pk[2 + n++] = xy_word(a);
-		pk[2 + n++] = uv_word(a);                   /* cba = 0 */
-		if (gouraud) pk[2 + n++] = col_word(b);
-		pk[2 + n++] = xy_word(b);
-		pk[2 + n++] = uv_word(b) | (tsb << 16);
-		if (gouraud) pk[2 + n++] = col_word(c);
-		pk[2 + n++] = xy_word(c);
-		pk[2 + n++] = uv_word(c);
 		vp[0] = a; vp[1] = b; vp[2] = c;
-		emit_packet(pk, n, vp, 3);
+		prim_uv_bytes(vp, 3, uvb);
+		pk[3 + n++] = cmd | col_word(a);
+		pk[3 + n++] = xy_word(a);
+		pk[3 + n++] = uvb[0];                       /* cba = 0 */
+		if (gouraud) pk[3 + n++] = col_word(b);
+		pk[3 + n++] = xy_word(b);
+		pk[3 + n++] = uvb[1] | (tsb << 16);
+		if (gouraud) pk[3 + n++] = col_word(c);
+		pk[3 + n++] = xy_word(c);
+		pk[3 + n++] = uvb[2];
+		emit_packet(pk, bound_tex->twin_word, n, vp, 3);
 	} else {
 		const Vtx *vp[4];
 
@@ -1367,14 +1429,14 @@ static void emit_tri(const Vtx *a, const Vtx *b, const Vtx *c)
 		pk = pkt_new(gouraud ? 6 : 4);
 		if (!pk)
 			return;
-		pk[2 + n++] = cmd | col_word(a);
-		pk[2 + n++] = xy_word(a);
-		if (gouraud) pk[2 + n++] = col_word(b);
-		pk[2 + n++] = xy_word(b);
-		if (gouraud) pk[2 + n++] = col_word(c);
-		pk[2 + n++] = xy_word(c);
+		pk[3 + n++] = cmd | col_word(a);
+		pk[3 + n++] = xy_word(a);
+		if (gouraud) pk[3 + n++] = col_word(b);
+		pk[3 + n++] = xy_word(b);
+		if (gouraud) pk[3 + n++] = col_word(c);
+		pk[3 + n++] = xy_word(c);
 		vp[0] = a; vp[1] = b; vp[2] = c; vp[3] = 0;
-		emit_packet(pk, n, vp, 3);
+		emit_packet(pk, 0, n, vp, 3);
 	}
 }
 
@@ -1401,39 +1463,44 @@ static void emit_quad(const Vtx *a, const Vtx *b,
 
 	if (st_texture_2d && bound_tex) {
 		u32 tsb = (u32)bound_tex->tpage_bits;
+		u32 uvb[4];
+		const Vtx *qvp[4];
 
 		cmd = ((gouraud ? 0x3Cu : 0x2Cu) | ((u32)semi << 1)) << 24;
 		pk = pkt_new(gouraud ? 12 : 9);
 		if (!pk)
 			return;
-		pk[2 + n++] = cmd | col_word(a);
-		pk[2 + n++] = xy_word(a);
-		pk[2 + n++] = uv_word(a);
-		if (gouraud) pk[2 + n++] = col_word(b);
-		pk[2 + n++] = xy_word(b);
-		pk[2 + n++] = uv_word(b) | (tsb << 16);
-		if (gouraud) pk[2 + n++] = col_word(c);
-		pk[2 + n++] = xy_word(c);
-		pk[2 + n++] = uv_word(c);
-		if (gouraud) pk[2 + n++] = col_word(d);
-		pk[2 + n++] = xy_word(d);
-		pk[2 + n++] = uv_word(d);
+		qvp[0] = a; qvp[1] = b; qvp[2] = c; qvp[3] = d;
+		prim_uv_bytes(qvp, 4, uvb);
+		pk[3 + n++] = cmd | col_word(a);
+		pk[3 + n++] = xy_word(a);
+		pk[3 + n++] = uvb[0];
+		if (gouraud) pk[3 + n++] = col_word(b);
+		pk[3 + n++] = xy_word(b);
+		pk[3 + n++] = uvb[1] | (tsb << 16);
+		if (gouraud) pk[3 + n++] = col_word(c);
+		pk[3 + n++] = xy_word(c);
+		pk[3 + n++] = uvb[2];
+		if (gouraud) pk[3 + n++] = col_word(d);
+		pk[3 + n++] = xy_word(d);
+		pk[3 + n++] = uvb[3];
 	} else {
 		cmd = ((gouraud ? 0x38u : 0x28u) | ((u32)semi << 1)) << 24;
 		pk = pkt_new(gouraud ? 8 : 5);
 		if (!pk)
 			return;
-		pk[2 + n++] = cmd | col_word(a);
-		pk[2 + n++] = xy_word(a);
-		if (gouraud) pk[2 + n++] = col_word(b);
-		pk[2 + n++] = xy_word(b);
-		if (gouraud) pk[2 + n++] = col_word(c);
-		pk[2 + n++] = xy_word(c);
-		if (gouraud) pk[2 + n++] = col_word(d);
-		pk[2 + n++] = xy_word(d);
+		pk[3 + n++] = cmd | col_word(a);
+		pk[3 + n++] = xy_word(a);
+		if (gouraud) pk[3 + n++] = col_word(b);
+		pk[3 + n++] = xy_word(b);
+		if (gouraud) pk[3 + n++] = col_word(c);
+		pk[3 + n++] = xy_word(c);
+		if (gouraud) pk[3 + n++] = col_word(d);
+		pk[3 + n++] = xy_word(d);
 	}
 	vp[0] = a; vp[1] = b; vp[2] = c; vp[3] = d;
-	emit_packet(pk, n, vp, 4);
+	emit_packet(pk, (st_texture_2d && bound_tex) ? bound_tex->twin_word : 0,
+		    n, vp, 4);
 }
 
 /* Emit one clipped screen-space line. */
@@ -1446,11 +1513,11 @@ static void emit_line(const Vtx *a, const Vtx *b)
 	pk = pkt_new(3);
 	if (!pk)
 		return;
-	pk[2] = cmd | col_word(a);
-	pk[3] = xy_word(a);
-	pk[4] = xy_word(b);
+	pk[3] = cmd | col_word(a);
+	pk[4] = xy_word(a);
+	pk[5] = xy_word(b);
 	vp[0] = a; vp[1] = b; vp[2] = a; vp[3] = 0;
-	emit_packet(pk, 3, vp, 2);
+	emit_packet(pk, 0, 3, vp, 2);
 }
 
 /* ------------------------------------------------ near-plane clipping */
