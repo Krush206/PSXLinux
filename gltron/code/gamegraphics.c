@@ -193,7 +193,7 @@ void drawCrash(float radius) {
   if(game->settings->show_alpha == 0) glDisable(GL_BLEND);
 }
 
-void drawCycle(Player *p) {
+void drawCycle(Player *p, float *cam) {
   float dirangles[] = { 180, 90, 0, 270 , 360, -90 };
   int time;
   int last_dir;
@@ -224,8 +224,18 @@ void drawCycle(Player *p) {
   glRotatef(dirangle, 0, 0.0, 1.0);
 
   if(game->settings->show_crash_texture)
-    if(p->data->exp_radius > 0 && p->data->exp_radius < EXP_RADIUS_MAX)
-      drawCrash(p->data->exp_radius);
+    if(p->data->exp_radius > 0 && p->data->exp_radius < EXP_RADIUS_MAX) {
+      /* The crash quad is 40x20 units centred on the bike.  When the
+       * camera sits inside that footprint the quad reaches the near
+       * plane and clips into a fan that spreads the whole 64x32-texel
+       * crash texture across the screen - a full-view artifact.
+       * Skip it there; distant explosions are unaffected. */
+      float dx = cam[0] - p->data->posx;
+      float dy = cam[1] - p->data->posy;
+      float dz = cam[2];
+      if(dx * dx + dy * dy + dz * dz > 20.0f * 20.0f)
+	drawCrash(p->data->exp_radius);
+    }
 
 #define neigung 25
   if(game->settings->turn_cycle) {
@@ -337,7 +347,7 @@ void drawPlayers(Player *p) {
     }
     if(playerVisible(p, &(game->player[i]))) {
       if(game->settings->show_model)
-	drawCycle(&(game->player[i]));
+	drawCycle(&(game->player[i]), p->camera->cam);
     }
   }
   if(game->settings->show_alpha != 1) glDisable(GL_BLEND);
