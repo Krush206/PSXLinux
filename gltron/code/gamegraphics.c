@@ -28,8 +28,50 @@ void drawScore(Player *p, gDisplay *d) {
   drawText(5, 5, 32, tmp);
 }
   
+static int floor_splits(float cam, float *out)
+{
+  float pts[40];
+  int n = 0, m = 0, i, k;
+
+  pts[n++] = 0.0f;
+  for(k = 0; k <= 6; k++) {
+    float s = (float)(1 << k);
+    float a = cam - s, b = cam + s;
+    if(a > 0.5f && a < (float)GSIZE - 0.5f) pts[n++] = a;
+    if(b > 0.5f && b < (float)GSIZE - 0.5f) pts[n++] = b;
+  }
+  if(cam > 0.5f && cam < (float)GSIZE - 0.5f)
+    pts[n++] = cam;
+  pts[n++] = (float)GSIZE;
+  /* insertion sort */
+  for(i = 1; i < n; i++) {
+    float v = pts[i];
+    int j = i - 1;
+    while(j >= 0 && pts[j] > v) { pts[j + 1] = pts[j]; j--; }
+    pts[j + 1] = v;
+  }
+  /* dedupe */
+  for(i = 0; i < n; i++)
+    if(m == 0 || pts[i] - out[m - 1] > 0.25f)
+      out[m++] = pts[i];
+  /* cap cell size at 25 units */
+  i = 0;
+  while(i < m - 1) {
+    if(out[i + 1] - out[i] > 25.0f && m < 38) {
+      int j;
+      for(j = m; j > i + 1; j--)
+	out[j] = out[j - 1];
+      out[i + 1] = (out[i] + out[i + 2]) * 0.5f;
+      m++;
+    } else
+      i++;
+  }
+  return m;
+}
+
 void drawFloor(gDisplay *d, float *cam) {
-  int j, k, l, t, a, b;
+  float xs[40], ys[40];
+  int nx, ny, i, j;
 
   if(game->settings->show_floor_texture) {
     glDepthMask(GL_TRUE);
@@ -38,47 +80,34 @@ void drawFloor(gDisplay *d, float *cam) {
     glDisable(GL_BLEND);
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, game->screen->texFloor);
-    /* there are some strange clipping artefacts in software mode */
-    /* try subdividing things... */
+    /* The PSX GPU maps textures affinely per primitive: a 50-unit
+     * tile carries only a few dozen texels and stretches them
+     * across the whole screen whenever the camera sits low.
+     * Emit the floor as a grid whose cells shrink with distance
+     * from the camera (floor_splits on each axis).  Texture
+     * phase comes straight from world position - one 64-texel
+     * repeat per 10 units, the original game's t=5 repeats per
+     * 50-unit tile - and minigl remaps each quad's UV bytes to
+     * that quad's own phase, so the graded split points do not
+     * need to align with repeat edges. */
     glColor4f(1.0, 1.0, 1.0, 1.0);
-    l = GSIZE / 4;
-    t = 3;   /* 3 repeats = 192 texels, fits the 8-bit PSX UV field */
-    for(j = 0; j < GSIZE; j += l)
-      for(k = 0; k < GSIZE; k += l) {
-	/*
-	 * The PSX GPU interpolates texture coordinates affinely per
-	 * quad: a 50-unit tile carrying 5 texture repeats shows its
-	 * lines spread evenly over the quad's screen area instead of
-	 * compressing toward the horizon ("wallpaper").  Subdivide
-	 * the tiles near the camera so every quad spans little
-	 * depth and the grid recedes properly; far tiles are small
-	 * on screen and keep the cheap single-quad path.
-	 */
-	int s = 1;
-	if(cam) {
-	  float cx = j + l / 2.0f - cam[0];
-	  float cy = k + l / 2.0f - cam[1];
-	  if(cx * cx + cy * cy < 70.0f * 70.0f)
-	    s = 4;
-	}
-	for(a = 0; a < s; a++)
-	  for(b = 0; b < s; b++) {
-	    int x0 = j + a * l / s, x1 = j + (a + 1) * l / s;
-	    int y0 = k + b * l / s, y1 = k + (b + 1) * l / s;
-	    float u0 = t * (float)a / s, u1 = t * (float)(a + 1) / s;
-	    float v0 = t * (float)b / s, v1 = t * (float)(b + 1) / s;
-	    glBegin(GL_QUADS);
-	    glTexCoord2f(u0, v0);
-	    glVertex2i(x0, y0);
-	    glTexCoord2f(u1, v0);
-	    glVertex2i(x1, y0);
-	    glTexCoord2f(u1, v1);
-	    glVertex2i(x1, y1);
-	    glTexCoord2f(u0, v1);
-	    glVertex2i(x0, y1);
-	    glEnd();
-	    polycount++;
-	  }
+    nx = floor_splits(cam ? cam[0] : 100.0f, xs);
+    ny = floor_splits(cam ? cam[1] : 100.0f, ys);
+    for(i = 0; i < nx - 1; i++)
+      for(j = 0; j < ny - 1; j++) {
+	int x0 = (int)(xs[i] + 0.5f);
+	int x1 = (int)(xs[i + 1] + 0.5f);
+	int y0 = (int)(ys[j] + 0.5f);
+	int y1 = (int)(ys[j + 1] + 0.5f);
+	if(x0 == x1 || y0 == y1)
+	  continue;
+	glBegin(GL_QUADS);
+	glTexCoord2f(x0 * 0.1f, y0 * 0.1f); glVertex2i(x0, y0);
+	glTexCoord2f(x1 * 0.1f, y0 * 0.1f); glVertex2i(x1, y0);
+	glTexCoord2f(x1 * 0.1f, y1 * 0.1f); glVertex2i(x1, y1);
+	glTexCoord2f(x0 * 0.1f, y1 * 0.1f); glVertex2i(x0, y1);
+	glEnd();
+	polycount++;
       }
     glDisable(GL_TEXTURE_2D);
     glDepthMask(GL_FALSE);
