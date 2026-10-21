@@ -28,31 +28,57 @@ void drawScore(Player *p, gDisplay *d) {
   drawText(5, 5, 32, tmp);
 }
   
-void drawFloor(gDisplay *d) {
-  int j, k, l, t;
+void drawFloor(gDisplay *d, float *cam) {
+  int j, k, l, t, a, b;
 
   if(game->settings->show_floor_texture) {
     glDepthMask(GL_TRUE);
+    /* floor and walls are opaque geometry; the global GL_BLEND state
+     * (used by the trails/glow) must not dim them */
+    glDisable(GL_BLEND);
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, game->screen->texFloor);
     /* there are some strange clipping artefacts in software mode */
     /* try subdividing things... */
     glColor4f(1.0, 1.0, 1.0, 1.0);
     l = GSIZE / 4;
-    t = 5;
+    t = 3;   /* 3 repeats = 192 texels, fits the 8-bit PSX UV field */
     for(j = 0; j < GSIZE; j += l)
       for(k = 0; k < GSIZE; k += l) {
-	glBegin(GL_QUADS);
-	glTexCoord2i(0, 0);
-	glVertex2i(j, k);
-	glTexCoord2i(t, 0);
-	glVertex2i(j + l, k);
-	glTexCoord2i(t, t);
-	glVertex2i(j + l, k + l);
-	glTexCoord2i(0, t);
-	glVertex2i(j, k + l);
-	glEnd();
-	polycount++;
+	/*
+	 * The PSX GPU interpolates texture coordinates affinely per
+	 * quad: a 50-unit tile carrying 5 texture repeats shows its
+	 * lines spread evenly over the quad's screen area instead of
+	 * compressing toward the horizon ("wallpaper").  Subdivide
+	 * the tiles near the camera so every quad spans little
+	 * depth and the grid recedes properly; far tiles are small
+	 * on screen and keep the cheap single-quad path.
+	 */
+	int s = 1;
+	if(cam) {
+	  float cx = j + l / 2.0f - cam[0];
+	  float cy = k + l / 2.0f - cam[1];
+	  if(cx * cx + cy * cy < 70.0f * 70.0f)
+	    s = 4;
+	}
+	for(a = 0; a < s; a++)
+	  for(b = 0; b < s; b++) {
+	    int x0 = j + a * l / s, x1 = j + (a + 1) * l / s;
+	    int y0 = k + b * l / s, y1 = k + (b + 1) * l / s;
+	    float u0 = t * (float)a / s, u1 = t * (float)(a + 1) / s;
+	    float v0 = t * (float)b / s, v1 = t * (float)(b + 1) / s;
+	    glBegin(GL_QUADS);
+	    glTexCoord2f(u0, v0);
+	    glVertex2i(x0, y0);
+	    glTexCoord2f(u1, v0);
+	    glVertex2i(x1, y0);
+	    glTexCoord2f(u1, v1);
+	    glVertex2i(x1, y1);
+	    glTexCoord2f(u0, v1);
+	    glVertex2i(x0, y1);
+	    glEnd();
+	    polycount++;
+	  }
       }
     glDisable(GL_TEXTURE_2D);
     glDepthMask(GL_FALSE);
@@ -69,6 +95,7 @@ void drawFloor(gDisplay *d) {
     }
     glEnd();
   }
+  glEnable(GL_BLEND);
 }
 
 void drawTraces(Player *p, gDisplay *d, int instance) {
@@ -147,7 +174,7 @@ void drawCycle(Player *p) {
 #define turn_length 500
 
   cycle = p->model->mesh;
-    
+
   glPushMatrix();
   glTranslatef(p->data->posx, p->data->posy, .0);
 
@@ -180,7 +207,7 @@ void drawCycle(Player *p) {
       else if((p->data->last_dir == 3 && p->data->dir == 2) ||
 	      (p->data->last_dir == 0 && p->data->dir == 3))
 	axis = -1.0;
-      glRotatef(neigung * sin(M_PI * time / turn_length),
+      glRotatef(neigung * sin((float)time * (3.14159265f / turn_length)),
 		0.0, axis, 0.0);
     }
   }
@@ -193,8 +220,9 @@ void drawCycle(Player *p) {
   glEnable(GL_DEPTH_TEST);
   glDepthMask(GL_TRUE);
 
-  if(p->data->exp_radius == 0)
+  if(p->data->exp_radius == 0) {
     drawModel(cycle, MODEL_USE_MATERIAL, 0);
+  }
   else if(p->data->exp_radius < EXP_RADIUS_MAX) {
     float alpha;
     glEnable(GL_BLEND);
@@ -230,7 +258,7 @@ int playerVisible(Player *eye, Player *target) {
   normalize(v2);
   s = scalarprod(v1, v2);
   /* maybe that's not exactly correct, but I didn't notice anything */
-  d = cos((game->settings->fov / 2) * 2 * M_PI / 360.0);
+  d = cos((float)(game->settings->fov / 2) * 0.00872664626f);
   /*
   printf("v1: %.2f %.2f %.2f\nv2: %.2f %.2f %.2f\ns: %.2f d: %.2f\n\n",
 	 v1[0], v1[1], v1[2], v2[0], v2[1], v2[2],
@@ -241,6 +269,14 @@ int playerVisible(Player *eye, Player *target) {
   else return 1;
 }
 	    
+/*
+ * PSX-style distance LOD: past this many units the cycle model
+ * covers a few pixels, so only the coloured base quad (already
+ * drawn for every player) marks the bike.  Squared distance, so
+ * the test is two multiplies.
+ */
+#define CYCLE_DRAW_DIST2 14400.0f      /* 120 units */
+
 void drawPlayers(Player *p) {
   int i;
   int dir;
@@ -302,18 +338,18 @@ void drawGlow(Player *p, gDisplay *d, float dim) {
 
   glVertex3f(0,TRAIL_HEIGHT/2, 0);
   glColor4f(0,0,0,0.0);
-  glVertex3f(dim*cos(-0.2*3.1415/5.0),
-	     TRAIL_HEIGHT/2+dim*sin(-0.2*3.1415/5.0), 0);
-  glVertex3f(dim*cos(1.0*3.1415/5.0),
-	     TRAIL_HEIGHT/2+dim*sin(1.0*3.1415/5.0), 0);
-  glVertex3f(dim*cos(2.0*3.1415/5.0),
-	     TRAIL_HEIGHT/2+dim*sin(2.0*3.1415/5.0), 0);
-  glVertex3f(dim*cos(3.0*3.1415/5.0),
-	     TRAIL_HEIGHT/2+dim*sin(3.0*3.1415/5.0), 0);
-  glVertex3f(dim*cos(4.0*3.1415/5.0),
-	     TRAIL_HEIGHT/2+dim*sin(4.0*3.1415/5.0), 0);
-  glVertex3f(dim*cos(5.2*3.1415/5.0),
-	     TRAIL_HEIGHT/2+dim*sin(5.2*3.1415/5.0), 0);
+  glVertex3f(dim*cos(-0.2*3.1415f/5.0f),
+	     TRAIL_HEIGHT/2+dim*sin(-0.2*3.1415f/5.0f), 0);
+  glVertex3f(dim*cos(1.0*3.1415f/5.0f),
+	     TRAIL_HEIGHT/2+dim*sin(1.0*3.1415f/5.0f), 0);
+  glVertex3f(dim*cos(2.0*3.1415f/5.0f),
+	     TRAIL_HEIGHT/2+dim*sin(2.0*3.1415f/5.0f), 0);
+  glVertex3f(dim*cos(3.0*3.1415f/5.0f),
+	     TRAIL_HEIGHT/2+dim*sin(3.0*3.1415f/5.0f), 0);
+  glVertex3f(dim*cos(4.0*3.1415f/5.0f),
+	     TRAIL_HEIGHT/2+dim*sin(4.0*3.1415f/5.0f), 0);
+  glVertex3f(dim*cos(5.2*3.1415f/5.0f),
+	     TRAIL_HEIGHT/2+dim*sin(5.2*3.1415f/5.0f), 0);
   glEnd();
   polycount += 5;
 
@@ -323,14 +359,14 @@ void drawGlow(Player *p, gDisplay *d, float dim) {
   glVertex3f(0,TRAIL_HEIGHT/2, 0);
   glColor4f(0,0,0,0.0);
   glVertex3f(0,-TRAIL_HEIGHT/4,0);
-  glVertex3f(dim*cos(-0.2*3.1415/5.0),
-	     TRAIL_HEIGHT/2+dim*sin(-0.2*3.1415/5.0), 0);
+  glVertex3f(dim*cos(-0.2*3.1415f/5.0f),
+	     TRAIL_HEIGHT/2+dim*sin(-0.2*3.1415f/5.0f), 0);
 
   glColor3fv(p->model->color_model);
   glVertex3f(0,TRAIL_HEIGHT/2, 0);
   glColor4f(0,0,0,0.0);
-  glVertex3f(dim*cos(5.2*3.1415/5.0),
-	     TRAIL_HEIGHT/2+dim*sin(5.2*3.1415/5.0), 0);
+  glVertex3f(dim*cos(5.2*3.1415f/5.0f),
+	     TRAIL_HEIGHT/2+dim*sin(5.2*3.1415f/5.0f), 0);
   glVertex3f(0,-TRAIL_HEIGHT/4,0);
   glEnd();
   polycount += 3;
@@ -343,45 +379,69 @@ void drawGlow(Player *p, gDisplay *d, float dim) {
 }
 
 void drawWalls(gDisplay *d) {
-  float t = 4;
+  float t = 3;                    /* 192 texels: fits the 8-bit UV field */
+  int seg;
+#define WALL_SEGS 8
   glColor4f(1.0, 1.0, 1.0, 1.0);
+  glDisable(GL_BLEND);
 
   glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-
-  /* glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); */
 
   glEnable(GL_CULL_FACE);
 
   glEnable(GL_TEXTURE_2D);
   glBindTexture(GL_TEXTURE_2D, game->screen->texWall);
   glBegin(GL_QUADS);
-  glTexCoord2f(t, 0.0); glVertex3f(0.0, 0.0, 0.0);
-  glTexCoord2f(t, 1.0); glVertex3f(0.0, 0.0, WALL_H);
-  glTexCoord2f(0.0, 1.0); glVertex3f(GSIZE, 0.0, WALL_H);
-  glTexCoord2f(0.0, 0.0); glVertex3f(GSIZE, 0.0, 0.0);
-
-  glTexCoord2f(t, 1.0); glVertex3f(GSIZE, 0.0, 0.0);
-  glTexCoord2f(t, 0.0); glVertex3f(GSIZE, 0.0, WALL_H);
-  glTexCoord2f(0.0, 0.0); glVertex3f(GSIZE, GSIZE, WALL_H);
-  glTexCoord2f(0.0, 1.0); glVertex3f(GSIZE, GSIZE, 0.0);
-
-  glTexCoord2f(t, 1.0); glVertex3f(GSIZE, GSIZE, 0.0);
-  glTexCoord2f(t, 0.0); glVertex3f(GSIZE, GSIZE, WALL_H);
-  glTexCoord2f(0.0, 0.0); glVertex3f(0.0, GSIZE, WALL_H);
-  glTexCoord2f(0.0, 1.0); glVertex3f(0.0, GSIZE, 0.0);
-
-  glTexCoord2f(t, 1.0); glVertex3f(0.0, GSIZE, 0.0);
-  glTexCoord2f(t, 0.0); glVertex3f(0.0, GSIZE, WALL_H);
-  glTexCoord2f(0.0, 0.0); glVertex3f(0.0, 0.0, WALL_H);
-  glTexCoord2f(0.0, 1.0); glVertex3f(0.0, 0.0, 0.0);
-
+  /* Each 200-unit wall is emitted in 25-unit segments: the PSX GPU
+   * maps textures affinely per quad, so one quad spanning the whole
+   * arena shears its texture along the view direction. */
+  for(seg = 0; seg < WALL_SEGS; seg++) {
+    float f0 = (float)seg / WALL_SEGS, f1 = (float)(seg + 1) / WALL_SEGS;
+    /* along +x at y=0: u = t at x=0 .. 0 at x=GSIZE */
+    {
+      float x0 = GSIZE * f0, x1 = GSIZE * f1;
+      float u0 = t * (1.0f - f0), u1 = t * (1.0f - f1);
+      glTexCoord2f(u0, 0.0); glVertex3f(x0, 0.0, 0.0);
+      glTexCoord2f(u0, 1.0); glVertex3f(x0, 0.0, WALL_H);
+      glTexCoord2f(u1, 1.0); glVertex3f(x1, 0.0, WALL_H);
+      glTexCoord2f(u1, 0.0); glVertex3f(x1, 0.0, 0.0);
+    }
+    /* along +y at x=GSIZE: u = t at y=0 .. 0 at y=GSIZE */
+    {
+      float y0 = GSIZE * f0, y1 = GSIZE * f1;
+      float u0 = t * (1.0f - f0), u1 = t * (1.0f - f1);
+      glTexCoord2f(u0, 1.0); glVertex3f(GSIZE, y0, 0.0);
+      glTexCoord2f(u0, 0.0); glVertex3f(GSIZE, y0, WALL_H);
+      glTexCoord2f(u1, 0.0); glVertex3f(GSIZE, y1, WALL_H);
+      glTexCoord2f(u1, 1.0); glVertex3f(GSIZE, y1, 0.0);
+    }
+    /* along -x at y=GSIZE: u = t at x=GSIZE .. 0 at x=0 */
+    {
+      float x0 = GSIZE * f1, x1 = GSIZE * f0;
+      float u0 = t * f1, u1 = t * f0;
+      glTexCoord2f(u0, 1.0); glVertex3f(x0, GSIZE, 0.0);
+      glTexCoord2f(u0, 0.0); glVertex3f(x0, GSIZE, WALL_H);
+      glTexCoord2f(u1, 0.0); glVertex3f(x1, GSIZE, WALL_H);
+      glTexCoord2f(u1, 1.0); glVertex3f(x1, GSIZE, 0.0);
+    }
+    /* along -y at x=0: u = t at y=GSIZE .. 0 at y=0 */
+    {
+      float y0 = GSIZE * f1, y1 = GSIZE * f0;
+      float u0 = t * f1, u1 = t * f0;
+      glTexCoord2f(u0, 1.0); glVertex3f(0.0, y0, 0.0);
+      glTexCoord2f(u0, 0.0); glVertex3f(0.0, y0, WALL_H);
+      glTexCoord2f(u1, 0.0); glVertex3f(0.0, y1, WALL_H);
+      glTexCoord2f(u1, 1.0); glVertex3f(0.0, y1, 0.0);
+    }
+  }
   glEnd();
-  polycount += 4;
+  polycount += 4 * WALL_SEGS;
 
   glDisable(GL_TEXTURE_2D);
 
   glDisable(GL_CULL_FACE);
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  glEnable(GL_BLEND);
 }
 
 /*
@@ -432,7 +492,7 @@ void drawCam(Player *p, gDisplay *d) {
 	    p->camera->target[0], p->camera->target[1], p->camera->target[2],
 	    0, 0, 1);
 
-  drawFloor(d);
+  drawFloor(d, p->camera->cam);
   if(game->settings->show_wall == 1)
     drawWalls(d);
   for(i = 0; i < game->players; i++)
