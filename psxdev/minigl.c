@@ -92,6 +92,25 @@ static sint gpu_fd = -1;
 static u32 gp0_batch[GP0_BATCH];
 static int gp0_batch_n;
 
+/* Near-plane clip threshold, Q16.16: the eye-space distance (clip w)
+ * below which geometry is clipped away.  Kept in sync with the
+ * projection's zNear by gluPerspective().  A near-clip at ~0 let
+ * polygons reaching to a few thousandths of a unit in front of the
+ * eye through: their projected coordinates explode (w divides to a
+ * tiny denominator), xy_word clamps them to 0..1023, and whatever
+ * texture crossed the camera - a floor tile at the camera's feet,
+ * the crash quad at the lens - smeared across the whole screen.
+ * Zero-initialized (BSS) on purpose: the exec loader maps .data as
+ * empty, so a non-zero initializer would load as garbage;
+ * glMiniInit() sets the 1.0 default. */
+static int W_EPS_Q;
+
+/* Last texture-window (GP0(E2h)) word emitted to the GPU; ot_emit()
+ * dedupes window changes while draining the ordering table.  Also
+ * BSS-zeroed - glMiniInit() resets it. */
+static u32 last_twin;
+static u32 last_e1;             /* last GP0(E1h) draw-mode echo */
+
 static int gpu_open(void)
 {
 	if (gpu_fd < 0)
@@ -191,17 +210,18 @@ static void ot_reset(int buff)
 }
 
 /* Packet layout: p[0] = OT link, p[1] = word count, p[2] = texture
- * window word (GP0(E2h), 0 = leave the window alone), p[3..] = the
- * GP0 primitive words. */
+ * window word (GP0(E2h), 0 = leave alone), p[3] = draw-mode echo
+ * word (GP0(E1h), 0 = leave alone; carries the semi-transparency
+ * rate for untextured prims), p[4..] = the GP0 primitive words. */
 static u_long *pkt_new(int words)
 {
 	u_long *p;
 
-	if (pkt_top + words + 3 >= pkt_arena + ARENA_WORDS)
+	if (pkt_top + words + 4 >= pkt_arena + ARENA_WORDS)
 		return 0;
 	p = pkt_top;
 	p[1] = words;
-	pkt_top += words + 3;
+	pkt_top += words + 4;
 	return p;
 }
 
@@ -215,12 +235,22 @@ static void pkt_link(int buff, int bucket, u_long *node)
 	ot[buff][bucket] = (u_long)node;
 }
 
+/* per-frame packet counter for the profiler in miniglut.c */
+static u32 pkts_now, pkts_last;
+
+u32 glStatPackets(void)
+{
+	return pkts_last;
+}
+
 static void ot_emit(int buff)
 {
-	/* The GPU's texture window is global state; each packet says
-	 * which window it needs and we emit the E2h only when it
-	 * changes while draining the table. */
-	static u32 last_twin = 0xffffffffu;
+	/* The GPU's texture window and draw mode are global state;
+	 * each packet carries the words it needs and we emit them
+	 * only on change while draining the table.  last_twin and
+	 * last_e1 live at file scope (BSS-zeroed; glMiniInit resets
+	 * them) because the exec loader maps .data empty - an
+	 * initializer would load as garbage. */
 	int i;
 
 	for (i = OT_SIZE - 1; i >= 0; i--) {
@@ -228,13 +258,18 @@ static void ot_emit(int buff)
 		for (p = (u_long *)ot[buff][i]; p; p = (u_long *)p[0]) {
 			int n = (int)p[1], j;
 			u32 twin = (u32)p[2];
+			u32 e1 = (u32)p[3];
 
 			if (twin != 0 && twin != last_twin) {
 				gp0_send(twin);
 				last_twin = twin;
 			}
+			if (e1 != 0 && e1 != last_e1) {
+				gp0_send(e1);
+				last_e1 = e1;
+			}
 			for (j = 0; j < n; j++)
-				gp0_send((u32)p[3 + j]);
+				gp0_send((u32)p[4 + j]);
 		}
 	}
 }
@@ -409,6 +444,12 @@ void gluPerspective(GLdouble fovy, GLdouble aspect,
 
 	f = 1.0f / tan((float)(fovy * 3.14159265358979323846 / 360.0));
 
+	/* the clipper cuts at the frustum's near plane, matching what
+	 * this projection assumes (see W_EPS_Q above) */
+	W_EPS_Q = f2q((float)zNear, 16);
+	if (W_EPS_Q < 2)
+		W_EPS_Q = 2;
+
 	for (i = 0; i < 16; i++)
 		p.m[i] = 0;
 	p.m[0]  = f2q(f / (float)aspect, 16);
@@ -524,6 +565,7 @@ typedef struct {
 static Tex texs[MAX_TEX];
 static Tex *bound_tex;
 static int  tex_env_modulate = 1;   /* GL_MODULATE default */
+static int  st_abr;                /* 1: additive (GL_ONE,GL_ONE) */
 static GLuint next_tex = 1;
 
 static int vram_next_x;              /* allocator marches across VRAM */
@@ -734,9 +776,12 @@ void glDisable(GLenum cap)
 
 void glBlendFunc(GLenum sfactor, GLenum dfactor)
 {
-	/* The PSX has a fixed per-primitive blend rate; both GL modes
-	 * GLTron uses map to the hardware average (B/2+F/2). */
-	(void)sfactor; (void)dfactor;
+	/* The PSX cannot weight by alpha, but it does have two useful
+	 * fixed rates: B/2+F/2 (ABR=0) and B+F additive (ABR=1).
+	 * GLTron's glow pass asks for (GL_ONE, GL_ONE) - additive -
+	 * which makes the radial fans add light instead of averaging
+	 * into solid slabs.  Everything else averages. */
+	st_abr = (sfactor == GL_ONE && dfactor == GL_ONE) ? 1 : 0;
 }
 
 void glShadeModel(GLenum mode)
@@ -911,7 +956,6 @@ void glRasterPos2i(GLint x, GLint y)     { (void)x; (void)y; }
 /* ------------------------------------------------------- immediate mode */
 
 #define MAX_VERTS 96
-#define W_EPS_Q   6           /* near-plane clip threshold, Q16.16 (~0.0001) */
 
 /*
  * All per-vertex data is kept in fixed point.  The R3000A has no FPU
@@ -1318,6 +1362,40 @@ static u32 col_word(const Vtx *v)
 	return (u32)(v->r8 | (v->g8 << 8) | (v->b8 << 16));
 }
 
+/* Per-primitive blend class, folding GL's blend/alpha state onto
+ * the PSX's one-bit ABE plus the 2-bit ABR rate:
+ *   - blending disabled, or every vertex alpha >= 128: opaque.
+ *     (The GPU's B/2+F/2 average would halve the bikes and trails
+ *     into dim "gray blobs", so mostly-opaque geometry must not
+ *     carry the blend bit at all.)
+ *   - additive intent (glBlendFunc GL_ONE,GL_ONE): ABE+ABR=1.
+ *     Black adds nothing, so the radial glow fans and engine
+ *     halos render as real light instead of averaged slabs.
+ *   - a vertex with alpha < 16 marks faded-out geometry (trail-end
+ *     quads, the crash flash tail): skipped entirely.
+ *   - anything else: ABE+ABR=0 average. */
+#define BL_OPAQUE 0
+#define BL_SEMI   1     /* ABE on, ABR=0 (B/2+F/2) */
+#define BL_ADD    2     /* ABE on, ABR=1 (B+F)     */
+#define BL_SKIP   3     /* fully faded out: drop   */
+
+static int blend_class(const Vtx *const *vp, int nv)
+{
+	int i, amin = 255;
+
+	if (!st_blend)
+		return BL_OPAQUE;
+	if (st_abr)
+		return BL_ADD;
+	for (i = 0; i < nv; i++) {
+		if (vp[i]->a8 < 16)
+			return BL_SKIP;
+		if (vp[i]->a8 < amin)
+			amin = vp[i]->a8;
+	}
+	return (amin >= 128) ? BL_OPAQUE : BL_SEMI;
+}
+
 /* Phase-correct UV bytes for one textured primitive.
  *
  * The PSX UV field is 8 bits, but the texture window (GP0(E2h))
@@ -1380,13 +1458,16 @@ static int depth_bucket(const Vtx *a, const Vtx *b,
 	return bucket;
 }
 
-static void emit_packet(u_long *pk, u32 twin, int n, const Vtx *const *vp, int nv)
+static void emit_packet(u_long *pk, u32 twin, u32 e1,
+			int n, const Vtx *const *vp, int nv)
 {
 	int bucket = depth_bucket(vp[0], vp[1],
 				  nv > 2 ? vp[2] : vp[1], vp[3]);
 
 	pk[1] = n;
 	pk[2] = twin;
+	pk[3] = e1;
+	pkts_now++;
 	pkt_link(active_buff ^ 1, bucket, pk);
 }
 
@@ -1394,10 +1475,17 @@ static void emit_packet(u_long *pk, u32 twin, int n, const Vtx *const *vp, int n
 static void emit_tri(const Vtx *a, const Vtx *b, const Vtx *c)
 {
 	u32 cmd;
-	int semi = st_blend ? 1 : 0;
+	int bcls;
 	int gouraud = st_shade_smooth;
 	u_long *pk;
 	int n = 0;
+	{
+		const Vtx *sv[3] = { a, b, c };
+
+		bcls = blend_class(sv, 3);
+	}
+	if (bcls == BL_SKIP)
+		return;
 
 	if (st_texture_2d && bound_tex) {
 		u32 tsb = (u32)bound_tex->tpage_bits;
@@ -1406,37 +1494,42 @@ static void emit_tri(const Vtx *a, const Vtx *b, const Vtx *c)
 
 		/* semi-transparency = ABE = command bit 25, i.e. +2 in
 		 * the low byte (bit 24 is TGE: raw-texture mode) */
-		cmd = ((gouraud ? 0x34u : 0x24u) | ((u32)semi << 1)) << 24;
+		cmd = ((gouraud ? 0x34u : 0x24u) |
+		       ((u32)(bcls != BL_OPAQUE) << 1)) << 24;
 		pk = pkt_new(gouraud ? 9 : 7);
 		if (!pk)
 			return;
 		vp[0] = a; vp[1] = b; vp[2] = c;
 		prim_uv_bytes(vp, 3, uvb);
-		pk[3 + n++] = cmd | col_word(a);
-		pk[3 + n++] = xy_word(a);
-		pk[3 + n++] = uvb[0];                       /* cba = 0 */
-		if (gouraud) pk[3 + n++] = col_word(b);
-		pk[3 + n++] = xy_word(b);
-		pk[3 + n++] = uvb[1] | (tsb << 16);
-		if (gouraud) pk[3 + n++] = col_word(c);
-		pk[3 + n++] = xy_word(c);
-		pk[3 + n++] = uvb[2];
-		emit_packet(pk, bound_tex->twin_word, n, vp, 3);
+		tsb = (tsb & ~0x60u) |
+		      ((bcls == BL_ADD) ? 0x20u : 0u);   /* ABR rate */
+		pk[4 + n++] = cmd | col_word(a);
+		pk[4 + n++] = xy_word(a);
+		pk[4 + n++] = uvb[0];                       /* cba = 0 */
+		if (gouraud) pk[4 + n++] = col_word(b);
+		pk[4 + n++] = xy_word(b);
+		pk[4 + n++] = uvb[1] | (tsb << 16);
+		if (gouraud) pk[4 + n++] = col_word(c);
+		pk[4 + n++] = xy_word(c);
+		pk[4 + n++] = uvb[2];
+		emit_packet(pk, bound_tex->twin_word, 0, n, vp, 3);
 	} else {
 		const Vtx *vp[4];
 
-		cmd = ((gouraud ? 0x30u : 0x20u) | ((u32)semi << 1)) << 24;
+		cmd = ((gouraud ? 0x30u : 0x20u) |
+		       ((u32)(bcls != BL_OPAQUE) << 1)) << 24;
 		pk = pkt_new(gouraud ? 6 : 4);
 		if (!pk)
 			return;
-		pk[3 + n++] = cmd | col_word(a);
-		pk[3 + n++] = xy_word(a);
-		if (gouraud) pk[3 + n++] = col_word(b);
-		pk[3 + n++] = xy_word(b);
-		if (gouraud) pk[3 + n++] = col_word(c);
-		pk[3 + n++] = xy_word(c);
+		pk[4 + n++] = cmd | col_word(a);
+		pk[4 + n++] = xy_word(a);
+		if (gouraud) pk[4 + n++] = col_word(b);
+		pk[4 + n++] = xy_word(b);
+		if (gouraud) pk[4 + n++] = col_word(c);
+		pk[4 + n++] = xy_word(c);
 		vp[0] = a; vp[1] = b; vp[2] = c; vp[3] = 0;
-		emit_packet(pk, 0, n, vp, 3);
+		emit_packet(pk, 0,
+			    (bcls == BL_ADD) ? 0xE1000020u : 0, n, vp, 3);
 	}
 }
 
@@ -1455,69 +1548,88 @@ static void emit_quad(const Vtx *a, const Vtx *b,
 	/* cyclic (a,b,c,d) -> zigzag (a,b,d,c) */
 	const Vtx *t = c_in, *c = d_in, *d = t;
 	u32 cmd;
-	int semi = st_blend ? 1 : 0;
+	int bcls;
 	int gouraud = st_shade_smooth;
 	u_long *pk;
 	int n = 0;
 	const Vtx *vp[4];
+	u32 twin, e1;
+	{
+		const Vtx *sv[4] = { a, b, c, d };
+
+		bcls = blend_class(sv, 4);
+	}
+	if (bcls == BL_SKIP)
+		return;
 
 	if (st_texture_2d && bound_tex) {
 		u32 tsb = (u32)bound_tex->tpage_bits;
 		u32 uvb[4];
 		const Vtx *qvp[4];
 
-		cmd = ((gouraud ? 0x3Cu : 0x2Cu) | ((u32)semi << 1)) << 24;
+		cmd = ((gouraud ? 0x3Cu : 0x2Cu) |
+		       ((u32)(bcls != BL_OPAQUE) << 1)) << 24;
 		pk = pkt_new(gouraud ? 12 : 9);
 		if (!pk)
 			return;
 		qvp[0] = a; qvp[1] = b; qvp[2] = c; qvp[3] = d;
 		prim_uv_bytes(qvp, 4, uvb);
-		pk[3 + n++] = cmd | col_word(a);
-		pk[3 + n++] = xy_word(a);
-		pk[3 + n++] = uvb[0];
-		if (gouraud) pk[3 + n++] = col_word(b);
-		pk[3 + n++] = xy_word(b);
-		pk[3 + n++] = uvb[1] | (tsb << 16);
-		if (gouraud) pk[3 + n++] = col_word(c);
-		pk[3 + n++] = xy_word(c);
-		pk[3 + n++] = uvb[2];
-		if (gouraud) pk[3 + n++] = col_word(d);
-		pk[3 + n++] = xy_word(d);
-		pk[3 + n++] = uvb[3];
+		tsb = (tsb & ~0x60u) |
+		      ((bcls == BL_ADD) ? 0x20u : 0u);   /* ABR rate */
+		pk[4 + n++] = cmd | col_word(a);
+		pk[4 + n++] = xy_word(a);
+		pk[4 + n++] = uvb[0];
+		if (gouraud) pk[4 + n++] = col_word(b);
+		pk[4 + n++] = xy_word(b);
+		pk[4 + n++] = uvb[1] | (tsb << 16);
+		if (gouraud) pk[4 + n++] = col_word(c);
+		pk[4 + n++] = xy_word(c);
+		pk[4 + n++] = uvb[2];
+		if (gouraud) pk[4 + n++] = col_word(d);
+		pk[4 + n++] = xy_word(d);
+		pk[4 + n++] = uvb[3];
+		twin = bound_tex->twin_word;
+		e1 = 0;
 	} else {
-		cmd = ((gouraud ? 0x38u : 0x28u) | ((u32)semi << 1)) << 24;
+		cmd = ((gouraud ? 0x38u : 0x28u) |
+		       ((u32)(bcls != BL_OPAQUE) << 1)) << 24;
 		pk = pkt_new(gouraud ? 8 : 5);
 		if (!pk)
 			return;
-		pk[3 + n++] = cmd | col_word(a);
-		pk[3 + n++] = xy_word(a);
-		if (gouraud) pk[3 + n++] = col_word(b);
-		pk[3 + n++] = xy_word(b);
-		if (gouraud) pk[3 + n++] = col_word(c);
-		pk[3 + n++] = xy_word(c);
-		if (gouraud) pk[3 + n++] = col_word(d);
-		pk[3 + n++] = xy_word(d);
+		pk[4 + n++] = cmd | col_word(a);
+		pk[4 + n++] = xy_word(a);
+		if (gouraud) pk[4 + n++] = col_word(b);
+		pk[4 + n++] = xy_word(b);
+		if (gouraud) pk[4 + n++] = col_word(c);
+		pk[4 + n++] = xy_word(c);
+		if (gouraud) pk[4 + n++] = col_word(d);
+		pk[4 + n++] = xy_word(d);
+		twin = 0;
+		e1 = (bcls == BL_ADD) ? 0xE1000020u : 0;
 	}
 	vp[0] = a; vp[1] = b; vp[2] = c; vp[3] = d;
-	emit_packet(pk, (st_texture_2d && bound_tex) ? bound_tex->twin_word : 0,
-		    n, vp, 4);
+	emit_packet(pk, twin, e1, n, vp, 4);
 }
 
 /* Emit one clipped screen-space line. */
 static void emit_line(const Vtx *a, const Vtx *b)
 {
-	u32 cmd = (0x40u | ((st_blend ? 1u : 0u) << 1)) << 24;
+	const Vtx *sv[2] = { a, b };
+	int bcls = blend_class(sv, 2);
+	u32 cmd = (0x40u | ((u32)(bcls != BL_OPAQUE ? 1 : 0) << 1)) << 24;
 	u_long *pk;
 	const Vtx *vp[4];
 
+	if (bcls == BL_SKIP)
+		return;
 	pk = pkt_new(3);
 	if (!pk)
 		return;
-	pk[3] = cmd | col_word(a);
-	pk[4] = xy_word(a);
-	pk[5] = xy_word(b);
+	pk[4] = cmd | col_word(a);
+	pk[5] = xy_word(a);
+	pk[6] = xy_word(b);
 	vp[0] = a; vp[1] = b; vp[2] = a; vp[3] = 0;
-	emit_packet(pk, 0, 3, vp, 2);
+	emit_packet(pk, 0, (bcls == BL_ADD) ? 0xE1000020u : 0, 3, vp, 2);
 }
 
 /* ------------------------------------------------ near-plane clipping */
@@ -1722,6 +1834,14 @@ int glMiniInit(void)
 	if (gpu_open() < 0)
 		return -1;
 
+	/* NB: the ECOFF exec path loads .text and zero-fills .bss but
+	 * maps .data with size 0 - initialized statics would load as
+	 * garbage.  Keep non-zero defaults here (BSS starts zeroed):
+	 * W_EPS_Q = 1.0 until the game's gluPerspective sets zNear. */
+	W_EPS_Q = 65536;
+	last_twin = 0;
+	last_e1 = 0;
+
 	/* display: 320x240 NTSC (register values from psx-spx:
 	 * GP1(06h) X1=600/X2=3160, GP1(07h) Y1=0x10/Y2=0x100) */
 	gp1_send(0x00000000);              /* soft reset */
@@ -1741,6 +1861,10 @@ int glMiniInit(void)
 void glSwapBuffersPSX(void)
 {
 	int drawn = active_buff ^ 1;
+
+	/* the frame's packets are all built: snapshot the count */
+	pkts_last = pkts_now;
+	pkts_now = 0;
 
 	/* push all packets for the frame we just built */
 	ot_emit(drawn);
