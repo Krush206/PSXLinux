@@ -23,6 +23,24 @@
  */
 
 #include "miniglut.h"
+#include "psxsys.h"     /* sys_call3, SYS_gettimeofday */
+
+/* ---------------------------------------------------------------- clock */
+/*
+ * The game advances its world by a fixed 17 ms per loop, which ties
+ * the world speed to the frame rate: at ~16 fps the arena runs at
+ * ~27% speed.  Advance the GLUT clock with the real wall time
+ * instead (kernel gettimeofday), clamped so a hitch cannot make the
+ * simulation jump.
+ */
+static unsigned real_ms(void)
+{
+	struct { int sec, usec; } tv;          /* struct timeval */
+
+	sys_call3(SYS_gettimeofday, (sint)&tv, 0, 0);
+	return (unsigned)tv.sec * 1000u + (unsigned)tv.usec / 1000u;
+}
+#include "psxsys.h"     /* sys_call3, SYS_gettimeofday */
 
 typedef unsigned int   u32;
 typedef unsigned short u16;
@@ -223,7 +241,22 @@ static void dispatch_keys(void)
 
 void glutMainLoop(void)
 {
+	static unsigned last_real;
+
 	for (;;) {
+		unsigned now = real_ms();
+		unsigned d;
+
+		if (last_real == 0 || now == last_real)
+			d = 17;                        /* first loop / same ms */
+		else {
+			d = now - last_real;
+			if (d > 100)
+				d = 100;               /* clamp long hitches */
+		}
+		last_real = now;
+		elapsed_ms += d;
+
 		pad_poll();
 		dispatch_keys();
 		frame_count++;
@@ -232,8 +265,6 @@ void glutMainLoop(void)
 			cb_idle();
 		if (cb_display)
 			cb_display();
-
-		elapsed_ms += 17;          /* ~60 Hz frame time */
 	}
 }
 
