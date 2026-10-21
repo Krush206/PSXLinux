@@ -50,16 +50,17 @@ int    vsprintf(char *buf, const char *fmt, void *ap);
 void   psx_putchar(int c);
 int    puts(const char *s);
 
-/* ---- math (float/double, via the soft-float library) ---- */
+/* ---- math (all single precision: the R3000A soft-floats doubles
+ *      at ~10x the cost of floats, and nothing here needs more) ---- */
 
-double sin(double x);
-double cos(double x);
-double tan(double x);
-double sqrt(double x);
-double fabs(double x);
-double floor(double x);
-double atan2(double y, double x);
-double pow(double x, double y);
+float sin(float x);
+float cos(float x);
+float tan(float x);
+float sqrt(float x);
+float fabs(float x);
+float floor(float x);
+float atan2(float y, float x);
+float pow(float x, float y);
 int    abs(int x);
 int    rand(void);
 void   srand(unsigned int seed);
