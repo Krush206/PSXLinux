@@ -46,6 +46,21 @@ typedef unsigned int   u32;
 typedef unsigned short u16;
 typedef unsigned char  u8;
 
+/* ---------------------------------------------------------------- timing */
+/* Per-phase profiling: milliseconds from the kernel clock, summed
+ * over PROF_EVERY frames and printed on the serial console.  (The
+ * cp0 COUNT register reads as a constant from user mode in this
+ * emulator, so the syscall clock it is.) */
+static u32 rcount(void)
+{
+	return real_ms();
+}
+
+#define PROF_EVERY 32
+static u32 acc_idle, acc_draw, acc_swap;   /* COUNT ticks per phase */
+extern int printf(const char *, ...);
+extern unsigned int glStatPackets(void);
+
 /* SIO0 — the controller port */
 #define JOY_DATA  (*(volatile u16 *)0x1F801040)
 #define JOY_STAT  (*(volatile u16 *)0x1F801044)
@@ -261,10 +276,36 @@ void glutMainLoop(void)
 		dispatch_keys();
 		frame_count++;
 
-		if (cb_idle)
-			cb_idle();
-		if (cb_display)
-			cb_display();
+		{
+			u32 t0 = rcount();
+
+			if (cb_idle)
+				cb_idle();
+			acc_idle += rcount() - t0;
+			t0 = rcount();
+			if (cb_display)
+				cb_display();
+			acc_draw += rcount() - t0;
+			acc_draw -= 0;   /* swap time is booked by glutSwapBuffers */
+		}
+
+		if ((frame_count % PROF_EVERY) == 0) {
+			u32 tot = acc_idle + acc_draw + acc_swap;
+			u32 other = 0;
+
+			/* subtract the swap share booked inside cb_display */
+			if (acc_swap <= acc_draw)
+				acc_draw -= acc_swap;
+			else {
+				other = acc_swap - acc_draw;
+				acc_draw = 0;
+			}
+			(void)other;
+			printf("prof: idle=%u draw=%u swap=%u pkts=%u fr=%u\n",
+			       acc_idle, acc_draw, acc_swap,
+			       glStatPackets(), frame_count);
+			acc_idle = acc_draw = acc_swap = 0;
+		}
 	}
 }
 
@@ -275,7 +316,10 @@ void glutPostRedisplay(void)
 
 void glutSwapBuffers(void)
 {
+	u32 t0 = rcount();
+
 	glSwapBuffersPSX();
+	acc_swap += rcount() - t0;
 }
 
 void glutWarpPointer(int x, int y)
