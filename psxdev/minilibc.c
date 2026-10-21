@@ -491,78 +491,86 @@ static void build_sin_table(void)
 	(void)quarter;
 }
 
-double sin(double x)
+float sin(float x)
 {
 	int idx;
-	const double scale = (double)SIN_TABLE_SIZE / 6.28318530717958647692;
+	const float scale = (float)SIN_TABLE_SIZE / 6.28318530717958647692f;
 
 	build_sin_table();
 	idx = (int)(x * scale);
 	idx &= (SIN_TABLE_SIZE - 1);
-	return (double)sin_table[idx];
+	return sin_table[idx];
 }
 
-double cos(double x)
+float cos(float x)
 {
-	return sin(x + 1.57079632679489661923);
+	return sin(x + 1.5707963f);
 }
 
-double tan(double x)
+float tan(float x)
 {
 	return sin(x) / cos(x);
 }
 
-double floor(double x)
+float floor(float x)
 {
 	int i = (int)x;
-	if ((double)i > x)
+	if ((float)i > x)
 		i--;
-	return (double)i;
+	return (float)i;
 }
 
-double fabs(double x)
+float fabs(float x)
 {
 	return x < 0 ? -x : x;
 }
 
-double sqrt(double x)
+/*
+ * Newton with a bit-trick seed: the classic exponent-halving guess
+ * starts within ~7%, so three iterations land well below 16-bit
+ * float precision.  The old double loop burned ~120k emulated
+ * cycles per call (24 soft-float double divisions); this one is
+ * ~1k.  Called ~10x per frame (gluLookAt, normalises).
+ */
+float sqrt(float x)
 {
-	double r;
+	union { float f; unsigned int i; } u;
+	float r;
 	int i;
 
-	if (x <= 0.0)
-		return 0.0;
-	if (x < 1e-20)
-		return 0.0;
-	r = x;
-	for (i = 0; i < 24; i++)
-		r = 0.5 * (r + x / r);
+	if (x <= 0.0f)
+		return 0.0f;
+	u.f = x;
+	u.i = (u.i >> 1) + 0x1fc00000u;
+	r = u.f;
+	for (i = 0; i < 3; i++)
+		r = 0.5f * (r + x / r);
 	return r;
 }
 
-double atan2(double y, double x)
+float atan2(float y, float x)
 {
 	/* Not used by the ported games; provided for completeness. */
-	double ax = fabs(x);
-	double ay = fabs(y);
-	double a;
+	float ax = fabs(x);
+	float ay = fabs(y);
+	float a;
 
-	if (ax + ay == 0.0)
-		return 0.0;
+	if (ax + ay == 0.0f)
+		return 0.0f;
 	a = ay / (ax + ay);
-	a = a * (0.7853981633974483 - 0.1963495408493621 * (a * a - 1.0)
-		 - 0.0981747704246810 * (a * a - 1.0) * (a * a - 1.0));
-	if (x < 0.0)
-		a = 1.5707963267948966 - a;
-	if (y < 0.0)
+	a = a * (0.7853981633974483f - 0.1963495408493621f * (a * a - 1.0f)
+		 - 0.0981747704246810f * (a * a - 1.0f) * (a * a - 1.0f));
+	if (x < 0.0f)
+		a = 1.5707963267948966f - a;
+	if (y < 0.0f)
 		a = -a;
 	return a;
 }
 
-double pow(double x, double y)
+float pow(float x, float y)
 {
 	int n;
-	double r = 1.0;
+	float r = 1.0f;
 	int neg = 0;
 	int iy = (int)y;
 
@@ -577,7 +585,7 @@ double pow(double x, double y)
 		x *= x;
 		n >>= 1;
 	}
-	return neg ? 1.0 / r : r;
+	return neg ? 1.0f / r : r;
 }
 
 int abs(int x)
