@@ -131,7 +131,7 @@ void colorDisc() {
     hsv2rgb(h, 1, 1, &r, &g, &b);
     glColor3f(r, g, b);
     /* printf("%.2f %.2f %.2f\n", r, g, b); */
-    glVertex3f(cos(h * 2 * M_PI / 360), sin(h * 2 * M_PI / 360), 0);
+    glVertex3f(cos(h * 0.017453292519943295f), sin(h * 0.017453292519943295f), 0);
   }
   glEnd();
 
