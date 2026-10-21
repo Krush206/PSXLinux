@@ -184,9 +184,9 @@ void initData() {
     cam->cam[2] = CAM_CIRCLE_Z;
 
     data->posx = GSIZE / 2 + GSIZE / 4 *
-      cos ( (float) (i * 2 * M_PI) / (float) game->players );
+      cos ( (float) (i * 2) * (6.28318530717958647692f / (float) game->players) );
     data->posy = GSIZE / 2 + GSIZE / 4 * 
-      sin ( (float) (i * 2 * M_PI) / (float) game->players );
+      sin ( (float) (i * 2) * (6.28318530717958647692f / (float) game->players) );
 
     data->dir = rand() & 3;
     data->last_dir = data->dir;
