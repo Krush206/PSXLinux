@@ -39,6 +39,23 @@ def rgb15(r, g, b, stp=0):
     b = max(0, min(255, int(b)))
     return ((b >> 3) << 10) | ((g >> 3) << 5) | (r >> 3) | ((stp & 1) << 15)
 
+def peak_sample(planes, xs, ys, x0, y0, w, h):
+    """Take the per-channel MAXIMUM over the w*h block.  Sparse line
+    art (the wall's thin magenta strokes, the crash streaks) must not
+    be averaged: a 4:1 box downsample dilutes a one-pixel line to a
+    quarter of its brightness, which turned tex_wall 99% black."""
+    R, G, B, A = planes
+    r = g = b = a = 0
+    for j in range(h):
+        base = (y0 + j) * xs
+        for i in range(w):
+            p = base + x0 + i
+            if R[p] > r: r = R[p]
+            if G[p] > g: g = G[p]
+            if B[p] > b: b = B[p]
+            if A[p] > a: a = A[p]
+    return r, g, b, a
+
 def box_sample(planes, xs, ys, x0, y0, w, h):
     """Average RGBA over the w*h block at (x0,y0)."""
     R, G, B, A = planes
@@ -280,24 +297,26 @@ def gen_textures():
     emit_u16('tex_floor', tex)
     print(f"floor: {xs}x{ys} -> {len(tex)} halfwords")
 
-    # wall 256x64 -> 64x64 (x box 4:1)
+    # wall 256x64 -> 64x64 (x 4:1 peak: keep the thin line work at
+    # full brightness - a box average dilutes it to black)
     xs, ys, zs, p = load_sgi('gltron_wall.sgi')
     assert (xs, ys) == (256, 64)
     tex = []
     for j in range(64):
         for i in range(64):
-            r, g, b, a = box_sample(p, xs, ys, i*4, j, 4, 1)
+            r, g, b, a = peak_sample(p, xs, ys, i*4, j, 4, 1)
             tex.append(rgb15(r, g, b))
     emit_u16('tex_wall', tex)
     print(f"wall: {xs}x{ys} -> 64x64")
 
-    # crash 256x256 -> 64x64, STP from alpha (semi-transparent where visible)
+    # crash 256x256 -> 64x64, STP from alpha (semi-transparent where
+    # visible); peak-sampled so the streaks keep their brightness
     xs, ys, zs, p = load_sgi('gltron_crash.sgi')
     assert (xs, ys) == (256, 256)
     tex = []
     for j in range(64):
         for i in range(64):
-            r, g, b, a = box_sample(p, xs, ys, i*4, j*4, 4, 4)
+            r, g, b, a = peak_sample(p, xs, ys, i*4, j*4, 4, 4)
             stp = 1 if a >= 16 else 0
             tex.append(rgb15(r, g, b, stp))
     emit_u16('tex_crash', tex)
