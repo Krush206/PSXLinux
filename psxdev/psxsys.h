@@ -33,6 +33,7 @@ typedef signed short	int16_t;
 #define SYS_execve		11
 #define SYS_chdir		12
 #define SYS_time		13
+#define SYS_gettimeofday	78
 #define SYS_mknod		14
 #define SYS_chmod		15
 #define SYS_lseek		19
