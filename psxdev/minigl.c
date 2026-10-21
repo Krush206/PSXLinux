@@ -37,11 +37,12 @@ typedef unsigned short u16;
 typedef unsigned char  u8;
 typedef unsigned long  u_long;
 
-/* soft-float math from minilibc (no FPU on the R3000A) */
-extern double sin(double);
-extern double cos(double);
-extern double tan(double);
-extern double sqrt(double);
+/* soft-float math from minilibc (no FPU on the R3000A); all
+ * single precision — double soft-float costs ~10x per operation */
+extern float sin(float);
+extern float cos(float);
+extern float tan(float);
+extern float sqrt(float);
 extern int printf(const char *fmt, ...);
 
 /* ------------------------------------------------------- /dev/psxgpu
@@ -225,16 +226,26 @@ static void ot_emit(int buff)
 }
 
 /* ------------------------------------------------------------- matrices */
+/*
+ * Matrices are kept in Q16.16 fixed point natively.  The R3000A has
+ * no FPU and a float 4x4 multiply costs ~112 soft-float library
+ * calls (~35k emulated cycles); the integer version is ~64 64-bit
+ * multiplies (~700 cycles).  Entries are converted once per GL
+ * matrix call (f2q), which is where the per-frame cost moved:
+ * glRotatef/glTranslatef now cost a handful of conversions instead
+ * of two float matrix multiplies.
+ */
+static int f2q(float f, int bits);      /* defined with the pipeline */
 
 typedef struct {
-	float m[16];      /* column-major, GL style */
+	int m[16];        /* column-major, GL style, Q16.16 */
 } Mat4;
 
 static const Mat4 ident_mat = {
-	{ 1.0f, 0.0f, 0.0f, 0.0f,
-	  0.0f, 1.0f, 0.0f, 0.0f,
-	  0.0f, 0.0f, 1.0f, 0.0f,
-	  0.0f, 0.0f, 0.0f, 1.0f }
+	{ 65536, 0, 0, 0,
+	  0, 65536, 0, 0,
+	  0, 0, 65536, 0,
+	  0, 0, 0, 65536 }
 };
 
 static Mat4 mv_stack[8];
@@ -243,20 +254,17 @@ static Mat4 mv;
 static Mat4 proj;
 static GLenum cur_matrix = GL_MODELVIEW;
 
-/* set by every matrix/light/material/fog mutation; the per-vertex
- * fixed-point state is refreshed lazily at the next glBegin */
-static int  fx_dirty = 1;
-
 static void mat_apply(Mat4 *a, const Mat4 *b)
 {
-	float r[16];
+	int r[16];
 	int c, i, k;
 
 	for (c = 0; c < 4; c++) {
 		for (i = 0; i < 4; i++) {
-			float s = 0.0f;
+			int s = 0;
 			for (k = 0; k < 4; k++)
-				s += a->m[k * 4 + i] * b->m[c * 4 + k];
+				s += (int)(((long long)a->m[k * 4 + i] *
+					    b->m[c * 4 + k]) >> 16);
 			r[c * 4 + i] = s;
 		}
 	}
@@ -283,7 +291,6 @@ void glPopMatrix(void)
 		if (mv_sp > 0)
 			mv = mv_stack[--mv_sp];
 	}
-	fx_dirty = 1;
 }
 
 void glLoadIdentity(void)
@@ -292,7 +299,6 @@ void glLoadIdentity(void)
 		mv = ident_mat;
 	else
 		proj = ident_mat;
-	fx_dirty = 1;
 }
 
 void glLoadMatrixf(const GLfloat *m)
@@ -301,20 +307,20 @@ void glLoadMatrixf(const GLfloat *m)
 	int i;
 
 	for (i = 0; i < 16; i++)
-		t->m[i] = m[i];
-	fx_dirty = 1;
+		t->m[i] = f2q(m[i], 16);
 }
 
 void glTranslatef(GLfloat x, GLfloat y, GLfloat z)
 {
 	Mat4 t = ident_mat;
 
-	t.m[12] = x; t.m[13] = y; t.m[14] = z;
+	t.m[12] = f2q(x, 16);
+	t.m[13] = f2q(y, 16);
+	t.m[14] = f2q(z, 16);
 	if (cur_matrix == GL_MODELVIEW)
 		mat_apply(&mv, &t);
 	else
 		mat_apply(&proj, &t);
-	fx_dirty = 1;
 }
 
 void glRotatef(GLfloat deg, GLfloat ax, GLfloat ay, GLfloat az)
@@ -328,39 +334,39 @@ void glRotatef(GLfloat deg, GLfloat ax, GLfloat ay, GLfloat az)
 	inv = 1.0f / len;
 	x = ax * inv; y = ay * inv; z = az * inv;
 
-	s = (float)sin((double)deg * 3.14159265 / 180.0);
-	c = (float)cos((double)deg * 3.14159265 / 180.0);
+	s = sin(deg * 0.017453292519943295f);
+	c = cos(deg * 0.017453292519943295f);
 	t = 1.0f - c;
 
-	r.m[0]  = x * x * t + c;
-	r.m[4]  = y * x * t + z * s;
-	r.m[8]  = z * x * t - y * s;
+	r.m[0]  = f2q(x * x * t + c, 16);
+	r.m[4]  = f2q(y * x * t + z * s, 16);
+	r.m[8]  = f2q(z * x * t - y * s, 16);
 
-	r.m[1]  = x * y * t - z * s;
-	r.m[5]  = y * y * t + c;
-	r.m[9]  = z * y * t + x * s;
+	r.m[1]  = f2q(x * y * t - z * s, 16);
+	r.m[5]  = f2q(y * y * t + c, 16);
+	r.m[9]  = f2q(z * y * t + x * s, 16);
 
-	r.m[2]  = x * z * t + y * s;
-	r.m[6]  = y * z * t - x * s;
-	r.m[10] = z * z * t + c;
+	r.m[2]  = f2q(x * z * t + y * s, 16);
+	r.m[6]  = f2q(y * z * t - x * s, 16);
+	r.m[10] = f2q(z * z * t + c, 16);
 
 	if (cur_matrix == GL_MODELVIEW)
 		mat_apply(&mv, &r);
 	else
 		mat_apply(&proj, &r);
-	fx_dirty = 1;
 }
 
 void glScalef(GLfloat x, GLfloat y, GLfloat z)
 {
 	Mat4 s = ident_mat;
 
-	s.m[0] = x; s.m[5] = y; s.m[10] = z;
+	s.m[0] = f2q(x, 16);
+	s.m[5] = f2q(y, 16);
+	s.m[10] = f2q(z, 16);
 	if (cur_matrix == GL_MODELVIEW)
 		mat_apply(&mv, &s);
 	else
 		mat_apply(&proj, &s);
-	fx_dirty = 1;
 }
 
 void glOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t,
@@ -368,17 +374,16 @@ void glOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t,
 {
 	Mat4 o = ident_mat;
 
-	o.m[0]  = 2.0f / (float)(r - l);
-	o.m[5]  = 2.0f / (float)(t - b);
-	o.m[10] = -2.0f / (float)(f - n);
-	o.m[12] = -((float)(r + l)) / (float)(r - l);
-	o.m[13] = -((float)(t + b)) / (float)(t - b);
-	o.m[14] = -((float)(f + n)) / (float)(f - n);
+	o.m[0]  = f2q(2.0f / (float)(r - l), 16);
+	o.m[5]  = f2q(2.0f / (float)(t - b), 16);
+	o.m[10] = f2q(-2.0f / (float)(f - n), 16);
+	o.m[12] = f2q(-((float)(r + l)) / (float)(r - l), 16);
+	o.m[13] = f2q(-((float)(t + b)) / (float)(t - b), 16);
+	o.m[14] = f2q(-((float)(f + n)) / (float)(f - n), 16);
 	if (cur_matrix == GL_MODELVIEW)
 		mat_apply(&mv, &o);
 	else
 		mat_apply(&proj, &o);
-	fx_dirty = 1;
 }
 
 void gluPerspective(GLdouble fovy, GLdouble aspect,
@@ -388,22 +393,22 @@ void gluPerspective(GLdouble fovy, GLdouble aspect,
 	float f;
 	int i;
 
-	f = (float)(1.0 / tan((double)fovy * 3.14159265 / 360.0));
+	f = 1.0f / tan((float)(fovy * 3.14159265358979323846 / 360.0));
 
 	for (i = 0; i < 16; i++)
-		p.m[i] = 0.0f;
-	p.m[0]  = f / (float)aspect;
-	p.m[5]  = f;
-	p.m[10] = ((float)zFar + (float)zNear) / ((float)zNear - (float)zFar);
-	p.m[11] = -1.0f;
-	p.m[14] = (2.0f * (float)zFar * (float)zNear) /
-		  ((float)zNear - (float)zFar);
+		p.m[i] = 0;
+	p.m[0]  = f2q(f / (float)aspect, 16);
+	p.m[5]  = f2q(f, 16);
+	p.m[10] = f2q(((float)zFar + (float)zNear) /
+		      ((float)zNear - (float)zFar), 16);
+	p.m[11] = -65536;                       /* -1.0 */
+	p.m[14] = f2q((2.0f * (float)zFar * (float)zNear) /
+		      ((float)zNear - (float)zFar), 16);
 
 	if (cur_matrix == GL_MODELVIEW)
 		mat_apply(&mv, &p);
 	else
 		mat_apply(&proj, &p);
-	fx_dirty = 1;
 }
 
 void gluLookAt(GLdouble ex, GLdouble ey, GLdouble ez,
@@ -428,25 +433,25 @@ void gluLookAt(GLdouble ex, GLdouble ey, GLdouble ez,
 	{
 		float n;
 
-		n = (float)sqrt((double)(fx * fx + fy * fy + fz * fz));
+		n = sqrt(fx * fx + fy * fy + fz * fz);
 		if (n > 0.0f) { fx /= n; fy /= n; fz /= n; }
-		n = (float)sqrt((double)(sx * sx + sy * sy + sz * sz));
+		n = sqrt(sx * sx + sy * sy + sz * sz);
 		if (n > 0.0f) { sx /= n; sy /= n; sz /= n; }
-		n = (float)sqrt((double)(rx * rx + ry * ry + rz * rz));
+		n = sqrt(rx * rx + ry * ry + rz * rz);
 		if (n > 0.0f) { rx /= n; ry /= n; rz /= n; }
 	}
 
-	m.m[0] = sx;   m.m[4] = sy;   m.m[8]  = sz;
-	m.m[1] = rx;   m.m[5] = ry;   m.m[9]  = rz;
-	m.m[2] = -fx;  m.m[6] = -fy;  m.m[10] = -fz;
+	m.m[0] = f2q(sx, 16);   m.m[4] = f2q(sy, 16);   m.m[8]  = f2q(sz, 16);
+	m.m[1] = f2q(rx, 16);   m.m[5] = f2q(ry, 16);   m.m[9]  = f2q(rz, 16);
+	m.m[2] = f2q(-fx, 16);  m.m[6] = f2q(-fy, 16);  m.m[10] = f2q(-fz, 16);
 
-	m.m[12] = -(sx * (float)ex + sy * (float)ey + sz * (float)ez);
-	m.m[13] = -(rx * (float)ex + ry * (float)ey + rz * (float)ez);
+	m.m[12] = f2q(-(sx * (float)ex + sy * (float)ey + sz * (float)ez), 16);
+	m.m[13] = f2q(-(rx * (float)ex + ry * (float)ey + rz * (float)ez), 16);
 	/* NB: row 3 is -f, so the translation is +f*eye (not -f*eye):
 	 * eye-space z = -f.p + f.eye = -f.(p - eye);  with the wrong
 	 * sign every point in front of the camera lands behind the
 	 * near plane and clip_near() culls the whole scene. */
-	m.m[14] = (fx * (float)ex + fy * (float)ey + fz * (float)ez);
+	m.m[14] = f2q(fx * (float)ex + fy * (float)ey + fz * (float)ez, 16);
 
 	if (cur_matrix == GL_MODELVIEW)
 		mat_apply(&mv, &m);
@@ -481,6 +486,10 @@ static int      light0_on;
 
 static GLfloat fog_start = 0.0f, fog_end = 1.0f;
 static GLfloat fog_color[4];
+
+/* set by the light/material/fog setters; the fixed-point lighting
+ * and fog coefficients are refreshed lazily at the next glEnd */
+static int fx_dirty = 1;
 
 static GLint vp_x, vp_y;
 static GLint vp_w = SCREEN_W, vp_h = SCREEN_H;
@@ -572,7 +581,7 @@ void glBindTexture(GLenum target, GLuint id)
 			      (t->h <= 128) ? 16 : 0;
 		else
 			my = 31;
-		gp0_send(0xE2000000u | mx | (my << 5));
+			gp0_send(0xE2000000u | mx | (my << 5));
 	} else {
 		bound_tex = 0;
 	}
@@ -823,8 +832,10 @@ void glFogf(GLenum pname, GLfloat param)
 
 void glFogfv(GLenum pname, const GLfloat *params)
 {
-	if (pname == GL_AMBIENT)                /* abused as FOG_COLOR */
-		copy4(fog_color, params), fx_dirty = 1;
+	if (pname == GL_AMBIENT) {              /* abused as FOG_COLOR */
+		copy4(fog_color, params);
+		fx_dirty = 1;
+	}
 }
 
 /* ---------------------------------------------------------------- queries */
@@ -850,7 +861,7 @@ void glGetFloatv(GLenum pname, GLfloat *params)
 
 	if (pname == GL_MODELVIEW_MATRIX)
 		for (i = 0; i < 16; i++)
-			params[i] = mv.m[i];
+			params[i] = (float)mv.m[i] * (1.0f / 65536.0f);
 }
 
 void glGetIntegerv(GLenum pname, GLint *params)
@@ -874,7 +885,7 @@ void glRasterPos2i(GLint x, GLint y)     { (void)x; (void)y; }
 
 /* ------------------------------------------------------- immediate mode */
 
-#define MAX_VERTS 48
+#define MAX_VERTS 96
 #define W_EPS_Q   6           /* near-plane clip threshold, Q16.16 (~0.0001) */
 
 /*
@@ -905,7 +916,6 @@ static int    prim_n;
 static Vtx    verts[MAX_VERTS];
 static int    in_begin;
 
-int f2q(float f, int bits);
 static int c2i(float f);
 
 void glBegin(GLenum mode)
@@ -1067,12 +1077,11 @@ static int f2q(float f, int bits)
 
 /* --------------------------------------------------- fixed point state */
 /*
- * Float matrices/parameters are converted to fixed point lazily,
- * once per glBegin at the latest, so the per-vertex inner loops
- * never touch the soft-float library.
+ * Light/material/fog coefficients are converted to fixed point
+ * lazily (at glEnd, when the dirty flag is set by the setters) so
+ * the per-vertex inner loops never touch the soft-float library.
+ * The matrices themselves are fixed point natively — see Mat4.
  */
-static int  fx_mv[16];          /* Q16.16 modelview */
-static int  fx_proj[16];        /* Q16.16 projection */
 static int  fx_light_dir[3];    /* Q2.14, directional */
 static int  fx_lp[3];           /* Q16.16, positional light pos */
 static int  fx_amb8[3];         /* ambient * light, 0..255 */
@@ -1086,10 +1095,6 @@ static void fx_rebuild(void)
 {
 	int i;
 
-	for (i = 0; i < 16; i++) {
-		fx_mv[i]   = f2q(mv.m[i], 16);
-		fx_proj[i] = f2q(proj.m[i], 16);
-	}
 	for (i = 0; i < 3; i++) {
 		fx_light_dir[i] = f2q(light_dir[i], 14);
 		fx_lp[i]        = f2q(light_pos[i], 16);
@@ -1183,7 +1188,8 @@ static void project_vtx(Vtx *v)
  * projection — all in Q16.16 fixed point. */
 static void transform_vertex(Vtx *v)
 {
-	const int *m = fx_mv;
+	const int *m = mv.m;            /* Q16.16, no conversion needed */
+	const int *pm = proj.m;
 	long long t;
 	int ex, ey, ez;
 
@@ -1250,17 +1256,17 @@ static void transform_vertex(Vtx *v)
 	}
 
 	/* projection -> clip coords (Q16.16) */
-	t  = (long long)fx_proj[0] * ex + (long long)fx_proj[4] * ey +
-	     (long long)fx_proj[8] * ez + fx_proj[12];
+	t  = (long long)pm[0] * ex + (long long)pm[4] * ey +
+	     (long long)pm[8] * ez + pm[12];
 	v->c[0] = (int)(t >> 16);
-	t  = (long long)fx_proj[1] * ex + (long long)fx_proj[5] * ey +
-	     (long long)fx_proj[9] * ez + fx_proj[13];
+	t  = (long long)pm[1] * ex + (long long)pm[5] * ey +
+	     (long long)pm[9] * ez + pm[13];
 	v->c[1] = (int)(t >> 16);
-	t  = (long long)fx_proj[2] * ex + (long long)fx_proj[6] * ey +
-	     (long long)fx_proj[10] * ez + fx_proj[14];
+	t  = (long long)pm[2] * ex + (long long)pm[6] * ey +
+	     (long long)pm[10] * ez + pm[14];
 	v->c[2] = (int)(t >> 16);
-	t  = (long long)fx_proj[3] * ex + (long long)fx_proj[7] * ey +
-	     (long long)fx_proj[11] * ez + fx_proj[15];
+	t  = (long long)pm[3] * ex + (long long)pm[7] * ey +
+	     (long long)pm[11] * ez + pm[15];
 	v->c[3] = (int)(t >> 16);
 
 	if (v->c[3] > W_EPS_Q)
