@@ -34,7 +34,8 @@ void initMainGameSettings(char *filename)
    * without usable alpha the closest look is no glow disc at all.
    * 'g' still toggles it at runtime. */
   game->settings->show_glow = 0;
-  game->settings->show_2d = 0;
+  /* trail map on by default - the reference build shows it */
+  game->settings->show_2d = 1;
   game->settings->show_alpha = 1;
   game->settings->show_floor_texture = 1;
   game->settings->show_crash_texture = 1;
