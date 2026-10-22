@@ -67,11 +67,18 @@ void ftxRenderString(fonttex *ftx, char *string, int len)
     cx = (float)(index % CELL_COLS) / (float)CELL_COLS;
     cy = (float)(index / CELL_COLS) * cv;
 
+    /* No V flip: glTexImage2DPSX uploads the sheet's first array
+     * row to VRAM v=0, so texture v grows downward through the
+     * sheet exactly as the generator laid the cells out.  (The
+     * 1.0-cy flip from the GL bottom-up convention sampled
+     * mirrored, mostly empty cells - garbled glyphs.)  The quad's
+     * bottom (y=0) takes the cell's bottom row (cy+cv), the top
+     * (y=1) the cell's top row (cy). */
     glBegin(GL_QUADS);
-    glTexCoord2f(cx,       1.0f - cy - cv); glVertex2f((float)i,       0.0f);
-    glTexCoord2f(cx + cu,  1.0f - cy - cv); glVertex2f((float)i + 1.0f, 0.0f);
-    glTexCoord2f(cx + cu,  1.0f - cy);      glVertex2f((float)i + 1.0f, 1.0f);
-    glTexCoord2f(cx,       1.0f - cy);      glVertex2f((float)i,       1.0f);
+    glTexCoord2f(cx,       cy + cv); glVertex2f((float)i,       0.0f);
+    glTexCoord2f(cx + cu,  cy + cv); glVertex2f((float)i + 1.0f, 0.0f);
+    glTexCoord2f(cx + cu,  cy);      glVertex2f((float)i + 1.0f, 1.0f);
+    glTexCoord2f(cx,       cy);      glVertex2f((float)i,       1.0f);
     glEnd();
   }
 }
