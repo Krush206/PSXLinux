@@ -7,8 +7,12 @@
  *
  * Pad protocol (SIO0 0x1F801040..4F), matching this emulator's sio.c
  * exactly:  CTRL=0x1003 (select pad 1, TX enable)  →  send 01h
- * (access, reply FFh)  →  42h (read buttons, reply 5Ah)  →  two dummy
- * bytes yielding the button pair  →  CTRL=0x1010 (deselect).
+ * (access, reply FFh)  →  42h (reply = pad ID, 41h digital / 73h
+ * analog)  →  00h (reply 5Ah sync)  →  00h (reply buttons byte A)
+ * →  00h (reply buttons byte B)  →  CTRL=0x1010 (deselect).  A
+ * poll that does not see the 5Ah sync byte reports "no buttons",
+ * never garbage — else a desynced poll reads zeroes and a resting
+ * pad looks like "everything pressed" (phantom ESC/pause/steering).
  *
  * IMPORTANT: every transfer's ACK raises I_STAT bit 7 (controller
  * interrupt).  The kernel has no handler registered for it, so we
@@ -60,9 +64,14 @@ static u32 rcount(void)
 static u32 acc_idle, acc_draw, acc_swap;   /* COUNT ticks per phase */
 extern int printf(const char *, ...);
 extern unsigned int glStatPackets(void);
+extern void glTakeCounters(unsigned *, unsigned *, unsigned *);
+extern void glProfTake(unsigned *);
 
-/* SIO0 — the controller port */
-#define JOY_DATA  (*(volatile u16 *)0x1F801040)
+/* SIO0 — the controller port.  The data register is byte-wide: a
+ * 16-bit access is split by the hardware (and the emulator) into
+ * two 8-bit transfers, so the trailing 0x00 high byte would abort
+ * every pad transaction. */
+#define JOY_DATA  (*(volatile u8 *)0x1F801040)
 #define JOY_STAT  (*(volatile u16 *)0x1F801044)
 #define JOY_MODE  (*(volatile u16 *)0x1F801048)
 #define JOY_CTRL  (*(volatile u16 *)0x1F80104A)
@@ -194,20 +203,24 @@ static u8 joy_xmit(u8 val)
 
 static void pad_poll(void)
 {
-	u8 b0, b1;
+	u8 id, sync, a, b;
 
 	pad_init_once();
 
 	JOY_CTRL = 0x1003;             /* select pad 1, TX enable */
-	joy_xmit(0x01);                /* access   -> 0xFF */
-	joy_xmit(0x42);                /* read     -> 0x5A */
-	b0 = joy_xmit(0x00);           /* buttons low */
-	b1 = joy_xmit(0x00);           /* buttons high */
+	(void)joy_xmit(0x01);          /* access   -> 0xFF */
+	id   = joy_xmit(0x42);          /* read     -> pad ID */
+	sync = joy_xmit(0x00);          /*          -> 0x5A */
+	a    = joy_xmit(0x00);          /*          -> SEL i j STA UP RIGHT DOWN LEFT */
+	b    = joy_xmit(0x00);          /*          -> L2 R2 L1 R1 TRI CIR CRO SQU */
 	JOY_CTRL = 0x1010;             /* deselect + clear error/ACK */
 	I_STAT = ~IRQ_CTRL;            /* drop the pending ACK */
 
 	pad_prev = pad_buttons;
-	pad_buttons = (u16)~(((u16)b1 << 8) | (u16)b0);  /* 1 = pressed */
+	if (sync != 0x5A || id != 0x41)    /* no pad / desynced / not digital pad */
+		pad_buttons = 0;               /* (memcard replies can interleave on SIO) */
+	else
+		pad_buttons = (u16)~(((u16)a << 8) | (u16)b);  /* 1 = pressed */
 }
 
 /* --------------------------------------------------------- key dispatch */
@@ -301,9 +314,19 @@ void glutMainLoop(void)
 				acc_draw = 0;
 			}
 			(void)other;
-			printf("prof: idle=%u draw=%u swap=%u pkts=%u fr=%u\n",
-			       acc_idle, acc_draw, acc_swap,
-			       glStatPackets(), frame_count);
+			{
+				unsigned v, pr, sc, ph[7];
+
+				glTakeCounters(&v, &pr, &sc);
+				glProfTake(ph);
+				printf("prof: idle=%u draw=%u swap=%u pkts=%u fr=%u vt=%u pr=%u sc=%u\n",
+				       acc_idle, acc_draw, acc_swap,
+				       glStatPackets(), frame_count,
+				       v, pr, sc);
+				printf("ph: setup=%u floor=%u walls=%u trails=%u bikes=%u glow=%u hud=%u (us)\n",
+				       ph[0], ph[1], ph[2], ph[3], ph[4],
+				       ph[5], ph[6]);
+			}
 			acc_idle = acc_draw = acc_swap = 0;
 		}
 	}
