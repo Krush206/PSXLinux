@@ -11,6 +11,8 @@
 
 #include "globals.h"
 
+extern void glProfPhase(int ph);   /* minigl.c draw-phase timer */
+
 int getElapsedTime(void) {
   return glutGet(GLUT_ELAPSED_TIME);
 }
@@ -23,6 +25,8 @@ void drawGame() {
   GLint i;
   gDisplay *d;
   Player *p;
+
+  glProfPhase(-1);   /* open the phase timer (excludes idle time) */
   polycount = 0;
   glClearColor(.0, .0, .0, .0);
   glDepthMask(GL_TRUE);
@@ -46,6 +50,7 @@ void drawGame() {
     drawDebugTex(game->screen);
   if(game->settings->show_fps)
     drawFPS(game->screen);
+  glProfPhase(6);        /* score/AI/map/fps overlays */
 }
 
 void displayGame() {
