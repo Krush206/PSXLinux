@@ -344,10 +344,17 @@ void glPopMatrix(void)
 
 void glLoadIdentity(void)
 {
-	if (cur_matrix == GL_MODELVIEW)
+	if (cur_matrix == GL_MODELVIEW) {
 		mv = ident_mat;
-	else
+	} else {
 		proj = ident_mat;
+		/* Identity projection = an ortho/rasonly HUD pass.
+		 * Its clip w is the constant 1.0, which would sit
+		 * below the perspective near-plane cut (zNear=3.0)
+		 * and erase every score/map/text vertex.  Drop the
+		 * w cut here; gluPerspective() restores it. */
+		W_EPS_Q = 2;
+	}
 }
 
 void glLoadMatrixf(const GLfloat *m)
@@ -431,8 +438,13 @@ void glOrtho(GLdouble l, GLdouble r, GLdouble b, GLdouble t,
 	o.m[14] = f2q(-((float)(f + n)) / (float)(f - n), 16);
 	if (cur_matrix == GL_MODELVIEW)
 		mat_apply(&mv, &o);
-	else
+	else {
 		mat_apply(&proj, &o);
+		/* ortho clip w == 1.0: same rationale as
+		 * glLoadIdentity() - never below the perspective
+		 * near-plane threshold */
+		W_EPS_Q = 2;
+	}
 }
 
 void gluPerspective(GLdouble fovy, GLdouble aspect,
@@ -942,16 +954,71 @@ void glGetIntegerv(GLenum pname, GLint *params)
 
 /* -------------------------------------------------------------- raster */
 
+static GLfloat raster_x, raster_y;
+
+void glRasterPos2f(GLfloat x, GLfloat y)
+{
+	raster_x = x;
+	raster_y = y;
+}
+
+void glRasterPos2i(GLint x, GLint y)
+{
+	raster_x = (GLfloat)x;
+	raster_y = (GLfloat)y;
+}
+
+/*
+ * GLTron draws its trail map (drawDebugTex) as a 1-bpp bitmap after
+ * glRasterPos2i; bitmap fonts are otherwise unused.  Each set bit
+ * becomes a 1x1 quad in the current colour, horizontal runs merged
+ * into one quad so a map frame stays a few dozen primitives.  Rows
+ * grow upward from the raster position - the orientation in which
+ * the (w)x(h) bitmap fills the border box drawn around it.  The
+ * caller sets UNPACK_ALIGNMENT 1, so the row stride is ceil(w/8).
+ */
 void glBitmap(GLsizei w, GLsizei h, GLfloat x0, GLfloat y0,
 	      GLfloat xi, GLfloat yi, const GLubyte *bitmap)
 {
-	/* GLTron renders text as textured quads; bitmap fonts unused. */
-	(void)w; (void)h; (void)x0; (void)y0; (void)xi; (void)yi;
-	(void)bitmap;
-}
+	int row, col, stride;
 
-void glRasterPos2f(GLfloat x, GLfloat y) { (void)x; (void)y; }
-void glRasterPos2i(GLint x, GLint y)     { (void)x; (void)y; }
+	(void)x0;
+	(void)y0;		/* caller origins are always 0 */
+
+	if (w <= 0 || h <= 0 || bitmap == 0)
+		return;
+	stride = (w + 7) >> 3;
+	glBegin(GL_QUADS);
+	for (row = 0; row < h; row++) {
+		const GLubyte *bp = bitmap + row * stride;
+		int run = -1;
+
+		for (col = 0; col <= w; col++) {
+			int set = 0;
+
+			if (col < w)
+				set = bp[col >> 3] & (0x80 >> (col & 7));
+			if (set) {
+				if (run < 0)
+					run = col;
+			} else if (run >= 0) {
+				float xa = raster_x + run;
+				float xb = raster_x + col;
+				float ya = raster_y + row;
+				float yb = ya + 1;
+
+				glVertex2f(xa, ya);
+				glVertex2f(xb, ya);
+				glVertex2f(xb, yb);
+				glVertex2f(xa, yb);
+				run = -1;
+			}
+		}
+	}
+	glEnd();
+	raster_x += xi;
+	raster_y += yi;
+}
 
 /* ------------------------------------------------------- immediate mode */
 
@@ -1239,12 +1306,16 @@ static void project_vtx(Vtx *v)
 	int half_w = vp_w >> 1;
 	int half_h = vp_h >> 1;
 
-	/* clamp degenerate ratios before the screen map (the emit
-	 * stage saturates anyway; this keeps the int32 math sane) */
-	if (ndc_x > 4 * 65536) ndc_x = 4 * 65536;
-	if (ndc_x < -4 * 65536) ndc_x = -4 * 65536;
-	if (ndc_y > 4 * 65536) ndc_y = 4 * 65536;
-	if (ndc_y < -4 * 65536) ndc_y = -4 * 65536;
+	/* Guard against degenerate ratios before the screen map.
+	 * The bound must stay far outside the viewport: saturating
+	 * at a small multiple (was +-4) bends edges of near-camera
+	 * geometry whose true NDC is much larger.  clip_screen()
+	 * bounds the resulting coordinates to the viewport anyway,
+	 * and the map below is done in long long, so +-64 is safe. */
+	if (ndc_x > 64 * 65536) ndc_x = 64 * 65536;
+	if (ndc_x < -64 * 65536) ndc_x = -64 * 65536;
+	if (ndc_y > 64 * 65536) ndc_y = 64 * 65536;
+	if (ndc_y < -64 * 65536) ndc_y = -64 * 65536;
 
 	v->sx = vp_x + (int)(((long long)(ndc_x + 65536) * half_w
 			     + 32768) >> 16);
@@ -1648,11 +1719,19 @@ static void clip_lerp(Vtx *out, const Vtx *a, const Vtx *b, int t)
 	out->u = a->u + (((b->u - a->u) * t) >> 16);
 	out->v = a->v + (((b->v - a->v) * t) >> 16);
 
-	/* screen position from the clipped clip-coords */
-	if (out->c[3] > W_EPS_Q)
+	/* screen position from the clipped clip-coords.  A near-plane
+	 * crossing vertex lands EXACTLY on the near plane
+	 * (w == W_EPS), so only require positivity here: project_vtx
+	 * then yields large-but-finite coordinates which the
+	 * viewport clip below bounds.  (Requiring w > W_EPS skipped
+	 * the projection and left stale sx/sy in the packet.) */
+	if (out->c[3] > 0) {
 		project_vtx(out);
-	else
+	} else {
 		out->dist = 0;
+		out->sx = 0;
+		out->sy = 0;
+	}
 }
 
 /*
@@ -1665,6 +1744,137 @@ static void clip_lerp(Vtx *out, const Vtx *a, const Vtx *b, int t)
  * to overflow it and corrupt the packet arena.
  */
 static Vtx clip_out[MAX_VERTS];
+
+/* Clip a projected polygon to the viewport rectangle in screen
+ * space.  The PSX packs x/y into an 11-bit coordinate field: a
+ * vertex outside it WRAPS, and xy_word()'s clamp moves each
+ * vertex independently instead - either way geometry just past
+ * the near-plane cut (whose projection lands far off-screen) got
+ * bent into the stray slabs and bands that littered the crash
+ * views.  The GPU rasterizes affine, so interpolating colours
+ * and UVs linearly in screen space matches the hardware exactly. */
+static Vtx scr_out[MAX_VERTS];
+
+static void scr_lerp(Vtx *o, const Vtx *a, const Vtx *b, int t)
+{
+	*o = *a;
+	o->sx = a->sx + (int)(((long long)(b->sx - a->sx) * t) >> 16);
+	o->sy = a->sy + (int)(((long long)(b->sy - a->sy) * t) >> 16);
+	o->r8 = a->r8 + (int)(((long long)(b->r8 - a->r8) * t) >> 16);
+	o->g8 = a->g8 + (int)(((long long)(b->g8 - a->g8) * t) >> 16);
+	o->b8 = a->b8 + (int)(((long long)(b->b8 - a->b8) * t) >> 16);
+	o->a8 = a->a8 + (int)(((long long)(b->a8 - a->a8) * t) >> 16);
+	o->u = a->u + (int)(((long long)(b->u - a->u) * t) >> 16);
+	o->v = a->v + (int)(((long long)(b->v - a->v) * t) >> 16);
+	o->dist = a->dist +
+		  (int)(((long long)(b->dist - a->dist) * t) >> 16);
+}
+
+static int clip_screen(Vtx *v, int n)
+{
+	int lo_x = vp_x, hi_x = vp_x + vp_w - 1;
+	int lo_y = vp_y, hi_y = vp_y + vp_h - 1;
+	int lim[4], p, i, m;
+	Vtx *src = v, *dst = scr_out, *swp;
+
+	if (n < 2)
+		return 0;
+	if (hi_x > 1023) hi_x = 1023;
+	if (hi_y > 1023) hi_y = 1023;
+	if (lo_x < 0) lo_x = 0;
+	if (lo_y < 0) lo_y = 0;
+	lim[0] = lo_x; lim[1] = hi_x; lim[2] = lo_y; lim[3] = hi_y;
+
+	/* quick accept: already inside the viewport */
+	for (i = 0; i < n; i++)
+		if (src[i].sx < lo_x || src[i].sx > hi_x ||
+		    src[i].sy < lo_y || src[i].sy > hi_y)
+			break;
+	if (i == n)
+		return n;
+
+	if (n == 2) {
+		/* Liang-Barsky segment clip (Q16.16 parameters) */
+		long long t0 = 0, t1 = 65536;
+
+		for (p = 0; p < 4; p++) {
+			int coord = (p < 2);
+			int low = !(p & 1);
+			int a_ = coord ? v[0].sx : v[0].sy;
+			int d = (coord ? v[1].sx : v[1].sy) - a_;
+			int L = lim[p];
+
+			if (d == 0) {
+				if (low ? (a_ < L) : (a_ > L))
+					return 0;
+			} else {
+				long long t =
+				    ((long long)(L - a_) << 16) / d;
+
+				if (low) {
+					if (d > 0) {
+						if (t > t0) t0 = t;
+					} else {
+						if (t < t1) t1 = t;
+					}
+				} else {
+					if (d < 0) {
+						if (t > t0) t0 = t;
+					} else {
+						if (t < t1) t1 = t;
+					}
+				}
+				if (t0 > t1)
+					return 0;
+			}
+		}
+		if (t0 == 0 && t1 == 65536)
+			return 2;
+		scr_lerp(&scr_out[0], &v[0], &v[1], (int)t0);
+		scr_lerp(&scr_out[1], &v[0], &v[1], (int)t1);
+		v[0] = scr_out[0];
+		v[1] = scr_out[1];
+		return 2;
+	}
+
+	/* Sutherland-Hodgman against the four viewport edges; the
+	 * result ping-pongs and ends up back in v (4 planes). */
+	for (p = 0; p < 4; p++) {
+		int coord = (p < 2);
+		int low = !(p & 1);
+		int L = lim[p];
+
+		m = 0;
+		for (i = 0; i < n; i++) {
+			const Vtx *a = &src[i], *b = &src[(i + 1) % n];
+			int av = coord ? a->sx : a->sy;
+			int bv = coord ? b->sx : b->sy;
+			int ain = low ? (av >= L) : (av <= L);
+			int bin = low ? (bv >= L) : (bv <= L);
+
+			if (ain) {
+				if (m >= MAX_VERTS)
+					break;
+				dst[m++] = *a;
+			}
+			if (ain != bin) {
+				int t = (int)(((long long)(L - av) << 16)
+					      / (bv - av));
+
+				if (m >= MAX_VERTS)
+					break;
+				scr_lerp(&dst[m++], a, b, t);
+			}
+		}
+		n = m;
+		if (n < 3)
+			return 0;
+		swp = src;
+		src = dst;
+		dst = swp;
+	}
+	return n;
+}
 
 static int clip_near(Vtx *v, int n)
 {
@@ -1682,7 +1892,7 @@ static int clip_near(Vtx *v, int n)
 		if (v[i].c[3] <= W_EPS_Q)
 			break;
 	if (i == n)
-		return n;
+		return clip_screen(v, n);
 
 	for (i = 0; i < n; i++) {
 		const Vtx *a = &v[i];
@@ -1711,7 +1921,7 @@ static int clip_near(Vtx *v, int n)
 		return 0;
 	for (i = 0; i < m; i++)
 		v[i] = out[i];
-	return m;
+	return clip_screen(v, m);
 }
 
 /* ---------------------------------------------------------------- glEnd */
@@ -1786,12 +1996,31 @@ void glEnd(void)
 	}
 
 	case GL_TRIANGLE_STRIP: {
-		int m = clip_near(verts, prim_n);
+		/* Clip every strip window as its own triangle.  Clipping
+		 * the whole strip as one closed polygon re-orders the
+		 * vertices (and truncates at MAX_VERTS), so re-emitting
+		 * sliding windows afterwards scrambles the ribbon into
+		 * stray bars - which showed up as debris and giant
+		 * wedges when the crash camera crossed a trail wall. */
+		Vtx tri[3];
 
-		if (m >= 3)
-			for (i = 0; i + 2 < m; i++)
-				emit_tri(&verts[i], &verts[i + 1],
-					 &verts[i + 2]);
+		for (i = 0; i + 2 < prim_n; i++) {
+			int m;
+
+			tri[0] = verts[i];
+			tri[1] = verts[i + 1];
+			tri[2] = verts[i + 2];
+			m = clip_near(tri, 3);
+			if (m == 3)
+				emit_tri(&tri[0], &tri[1], &tri[2]);
+			else if (m == 4) {
+				/* one vertex was outside: the clipper
+				 * returned a convex quad in cyclic
+				 * order - split it into two triangles */
+				emit_tri(&tri[0], &tri[1], &tri[2]);
+				emit_tri(&tri[0], &tri[2], &tri[3]);
+			}
+		}
 		break;
 	}
 
