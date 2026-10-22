@@ -118,6 +118,59 @@ static int gpu_open(void)
 	return gpu_fd;
 }
 
+/* per-frame unit counters (bumped inline, no syscalls) */
+static unsigned st_verts, st_prims, st_sclip;
+
+void glTakeCounters(unsigned *v, unsigned *p, unsigned *sc)
+{
+	*v = st_verts;
+	*p = st_prims;
+	*sc = st_sclip;
+	st_verts = st_prims = st_sclip = 0;
+}
+
+/* Sequential phase timer for the draw pipeline: each call closes
+ * the bucket opened by the previous mark.  ~14 calls per frame,
+ * so the gettimeofday cost stays negligible.  Buckets:
+ *   0 setup/clear   1 floor   2 walls  3 trails
+ *   4 players       5 glow    6 2D overlays            */
+#define PROF_N 7
+static unsigned prof_acc[PROF_N];
+static unsigned prof_last;
+static int      prof_inited;
+
+static unsigned prof_now(void)
+{
+	struct { int sec, usec; } tv;
+
+	sys_call3(SYS_gettimeofday, (sint)&tv, 0, 0);
+	return (unsigned)tv.sec * 1000000u + (unsigned)tv.usec;
+}
+
+void glProfPhase(int ph)
+{
+	unsigned now = prof_now();
+
+	if (!prof_inited) {
+		prof_inited = 1;
+		prof_last = now;
+	}
+	if (ph >= 0 && ph < PROF_N)
+		prof_acc[ph] += now - prof_last;
+	prof_last = now;
+}
+
+void glProfTake(unsigned *out)
+{
+	int i;
+
+	for (i = 0; i < PROF_N; i++) {
+		out[i] = prof_acc[i];
+		prof_acc[i] = 0;
+	}
+	prof_inited = 0;
+}
+
 static void gp0_flush(void)
 {
 	if (gp0_batch_n > 0) {
@@ -535,6 +588,7 @@ static int st_texture_2d;
 static int st_shade_smooth = 1;
 static int st_depth_test;
 static int st_depth_mask = 1;
+static int st_cull;               /* GL_CULL_FACE: drop back faces */
 
 static GLfloat clear_color[4];
 
@@ -769,7 +823,8 @@ void glEnable(GLenum cap)
 	case GL_FOG:        st_fog = 1; break;
 	case GL_TEXTURE_2D: st_texture_2d = 1; break;
 	case GL_DEPTH_TEST: st_depth_test = 1; break;
-	default: break;          /* GL_CULL_FACE: always off */
+	case GL_CULL_FACE:  st_cull = 1; break;
+	default: break;
 	}
 }
 
@@ -782,6 +837,7 @@ void glDisable(GLenum cap)
 	case GL_FOG:        st_fog = 0; break;
 	case GL_TEXTURE_2D: st_texture_2d = 0; break;
 	case GL_DEPTH_TEST: st_depth_test = 0; break;
+	case GL_CULL_FACE:  st_cull = 0; break;
 	default: break;
 	}
 }
@@ -980,7 +1036,7 @@ void glRasterPos2i(GLint x, GLint y)
 void glBitmap(GLsizei w, GLsizei h, GLfloat x0, GLfloat y0,
 	      GLfloat xi, GLfloat yi, const GLubyte *bitmap)
 {
-	int row, col, stride;
+	int row, stride;
 
 	(void)x0;
 	(void)y0;		/* caller origins are always 0 */
@@ -991,27 +1047,38 @@ void glBitmap(GLsizei w, GLsizei h, GLfloat x0, GLfloat y0,
 	glBegin(GL_QUADS);
 	for (row = 0; row < h; row++) {
 		const GLubyte *bp = bitmap + row * stride;
-		int run = -1;
+		int b;
 
-		for (col = 0; col <= w; col++) {
-			int set = 0;
+		/* byte-wise: empty rows (most of the map) cost one
+		 * compare, and runs skip their interior entirely */
+		for (b = 0; b < stride; b++) {
+			unsigned byte = bp[b];
+			int bit;
 
-			if (col < w)
-				set = bp[col >> 3] & (0x80 >> (col & 7));
-			if (set) {
-				if (run < 0)
-					run = col;
-			} else if (run >= 0) {
-				float xa = raster_x + run;
-				float xb = raster_x + col;
-				float ya = raster_y + row;
-				float yb = ya + 1;
+			if (byte == 0)
+				continue;
+			for (bit = 0; bit < 8; bit++) {
+				int start, c;
+				float xa, xb, ya, yb;
 
+				if (!(byte & (0x80u >> bit)))
+					continue;
+				start = b * 8 + bit;
+				c = start + 1;
+				while (c < w &&
+				       (bp[c >> 3] & (0x80u >> (c & 7))))
+					c++;
+				xa = raster_x + start;
+				xb = raster_x + c;
+				ya = raster_y + row;
+				yb = ya + 1;
 				glVertex2f(xa, ya);
 				glVertex2f(xb, ya);
 				glVertex2f(xb, yb);
 				glVertex2f(xa, yb);
-				run = -1;
+				bit = (c - b * 8) - 1;
+				if (bit >= 8)
+					break;   /* run left this byte */
 			}
 		}
 	}
@@ -1538,6 +1605,8 @@ static void emit_packet(u_long *pk, u32 twin, u32 e1,
 	pk[1] = n;
 	pk[2] = twin;
 	pk[3] = e1;
+	st_prims++;
+	st_verts += nv;
 	pkts_now++;
 	pkt_link(active_buff ^ 1, bucket, pk);
 }
@@ -1550,6 +1619,16 @@ static void emit_tri(const Vtx *a, const Vtx *b, const Vtx *c)
 	int gouraud = st_shade_smooth;
 	u_long *pk;
 	int n = 0;
+
+	if (st_cull) {
+		/* sy grows downward: a GL front face (CCW in window
+		 * coords, y up) has negative signed area here */
+		long area = (long)(b->sx - a->sx) * (c->sy - a->sy) -
+			    (long)(c->sx - a->sx) * (b->sy - a->sy);
+
+		if (area >= 0)
+			return;
+	}
 	{
 		const Vtx *sv[3] = { a, b, c };
 
@@ -1625,6 +1704,16 @@ static void emit_quad(const Vtx *a, const Vtx *b,
 	int n = 0;
 	const Vtx *vp[4];
 	u32 twin, e1;
+
+	if (st_cull) {
+		/* test the GL winding (a,b,c) before the reorder;
+		 * sy down flips the sign vs. window coordinates */
+		long area = (long)(b->sx - a->sx) * (c_in->sy - a->sy) -
+			    (long)(c_in->sx - a->sx) * (b->sy - a->sy);
+
+		if (area >= 0)
+			return;
+	}
 	{
 		const Vtx *sv[4] = { a, b, c, d };
 
@@ -1792,6 +1881,7 @@ static int clip_screen(Vtx *v, int n)
 			break;
 	if (i == n)
 		return n;
+	st_sclip++;		/* full S-H path taken */
 
 	if (n == 2) {
 		/* Liang-Barsky segment clip (Q16.16 parameters) */
