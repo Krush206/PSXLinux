@@ -333,15 +333,24 @@ void drawPlayers(Player *p) {
 		   0);
       /* draw Quad */
       dir = game->player[i].data->dir;
+      /* PSX adaptation: on the PC this wall fades out through
+       * vertex alpha (color at the bike, (0,0,0,0) further back)
+       * under standard alpha blending.  The PSX GPU has no
+       * per-pixel alpha, so reproduce the fade with additive
+       * blending instead: colour + background at the bike,
+       * background alone at the tail.  All vertex alphas stay at
+       * 1 so the emitted quads are not dropped as "faded". */
+      glBlendFunc(GL_ONE, GL_ONE);
       glColor3fv(game->player[i].model->color_model);
       glBegin(GL_QUADS);
       glVertex3f(0, 0, 0);
-      glColor4f(0, 0, 0, 0);
+      glColor3f(0.0, 0.0, 0.0);
       glVertex3f(-dirsX[ dir ] * l, -dirsY[ dir ] * l, 0);
       glVertex3f(-dirsX[ dir ] * l, -dirsY[ dir ] * l, height);
       glColor3fv(game->player[i].model->color_model);
       glVertex3f(0, 0, height);
       glEnd();
+      glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
       polycount++;
       glPopMatrix();
     }
@@ -418,7 +427,7 @@ void drawGlow(Player *p, gDisplay *d, float dim) {
 }
 
 void drawWalls(gDisplay *d) {
-  float t = 3;                    /* 192 texels: fits the 8-bit UV field */
+  float t = 4;                  /* 4 repeats over 200 units, as upstream */
   int seg;
 #define WALL_SEGS 8
   glColor4f(1.0, 1.0, 1.0, 1.0);
