@@ -26,7 +26,14 @@ void initMainGameSettings(char *filename)
   game->settings->show_help = 0;
   game->settings->show_fps = 1;
   game->settings->show_wall = 1;
-  game->settings->show_glow = 1;
+  /* The PSX has no per-pixel alpha, so the additive glow fans can
+   * only render at full rate - at 4x TRAIL_HEIGHT radius they
+   * swallow the 8-unit bike into a saturated blob (fine on the PC,
+   * where a perspective-correct soft halo stays subtle).  The
+   * Oct-20-3am build the user references has only a faint halo;
+   * without usable alpha the closest look is no glow disc at all.
+   * 'g' still toggles it at runtime. */
+  game->settings->show_glow = 0;
   game->settings->show_2d = 0;
   game->settings->show_alpha = 1;
   game->settings->show_floor_texture = 1;
