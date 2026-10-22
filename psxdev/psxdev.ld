@@ -9,6 +9,19 @@ OUTPUT_FORMAT("elf32-littlemips")
 OUTPUT_ARCH(mips)
 ENTRY(_start)
 
+/* Two loadable segments, text (R E) and data (RW).  With the single
+ * default RWE segment GNU ld emits, elf2ecoff folds everything into
+ * the text chunk and zeroes dsize - the ECOFF kernel loader then
+ * never copies .data, and every initialized static (minigl's
+ * material and colour defaults, glGenTextures' id counter, gpu_fd)
+ * ran as whatever zeros the boot memory held: lit geometry rendered
+ * black, the first texture got the invalid id 0. */
+PHDRS
+{
+    text PT_LOAD FLAGS(5);   /* R E */
+    data PT_LOAD FLAGS(6);   /* RW  */
+}
+
 SECTIONS
 {
     . = 0x00100000;
@@ -17,19 +30,19 @@ SECTIONS
         *(.text.start)
         *(.text)
         *(.text.*)
-    }
+    } :text
 
     .rodata : {
         *(.rodata)
         *(.rodata.*)
         *(.rdata)
-    }
+    } :text
 
     .data : {
         *(.data)
         *(.data.*)
         *(.sdata)
-    }
+    } :data
 
     _gp = . + 0x7FF0;
 
@@ -38,7 +51,7 @@ SECTIONS
         *(.bss.*)
         *(.sbss)
         *(COMMON)
-    }
+    } :data
 
     /DISCARD/ : {
         *(.MIPS.abiflags)
