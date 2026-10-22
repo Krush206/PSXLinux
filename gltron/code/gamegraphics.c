@@ -54,10 +54,12 @@ static int floor_splits(float cam, float *out)
   for(i = 0; i < n; i++)
     if(m == 0 || pts[i] - out[m - 1] > 0.25f)
       out[m++] = pts[i];
-  /* cap cell size at 25 units */
+  /* cap cell size at 36 units (far cells cover few pixels each;
+   * the affine stretch only matters for near cells, which stay
+   * split small) */
   i = 0;
   while(i < m - 1) {
-    if(out[i + 1] - out[i] > 25.0f && m < 38) {
+    if(out[i + 1] - out[i] > 36.0f && m < 38) {
       int j;
       for(j = m; j > i + 1; j--)
 	out[j] = out[j - 1];
@@ -140,19 +142,29 @@ void drawTraces(Player *p, gDisplay *d, int instance) {
     glColor4fv(p->model->color_alpha);
     /* glColor4f(0.5, 0.5, 0.5, 0.8); */
     line = &(data->trails[0]);
-    glBegin(GL_TRIANGLE_STRIP);
-    glVertex3f(line->sx, line->sy, 0.0);
-    glVertex3f(line->sx, line->sy, height);
-    while(line != data->trail) {
+    /* Each trail point becomes 2 strip windows; unbounded, that
+     * eats the whole prim budget as trails grow (a 300-point trail
+     * = 600 triangles).  Decimate to ~40 chords - the ribbon is
+     * 5 units tall, so 2-unit chords still read as smooth curves. */
+    {
+      int step = (int)(data->trail - line) / 40 + 1;
+
+      glBegin(GL_TRIANGLE_STRIP);
+      glVertex3f(line->sx, line->sy, 0.0);
+      glVertex3f(line->sx, line->sy, height);
+      while(line != data->trail) {
+	line += step;
+	if(line > data->trail)
+	  line = data->trail;
+	glVertex3f(line->ex, line->ey, 0.0);
+	glVertex3f(line->ex, line->ey, height);    
+	polycount++;
+      }
       glVertex3f(line->ex, line->ey, 0.0);
-      glVertex3f(line->ex, line->ey, height);    
-      line++;
-      polycount++;
+      glVertex3f(line->ex, line->ey, height);
+      polycount += 2;
+      glEnd();
     }
-    glVertex3f(line->ex, line->ey, 0.0);
-    glVertex3f(line->ex, line->ey, height);
-    polycount += 2;
-    glEnd();
 
     if(game->settings->camType == 1) {
       //       glLineWidth(3);
@@ -260,7 +272,12 @@ void drawCycle(Player *p, float *cam) {
   glDepthMask(GL_TRUE);
 
   if(p->data->exp_radius == 0) {
+    /* the cycle is a closed hull: cull back faces to halve its
+     * primitive count (minigl's GL_CULL_FACE is a screen-space
+     * signed-area test in the emit path) */
+    glEnable(GL_CULL_FACE);
     drawModel(cycle, MODEL_USE_MATERIAL, 0);
+    glDisable(GL_CULL_FACE);
   }
   else if(p->data->exp_radius < EXP_RADIUS_MAX) {
     float alpha;
@@ -539,20 +556,27 @@ void drawCam(Player *p, gDisplay *d) {
   gluLookAt(p->camera->cam[0], p->camera->cam[1], p->camera->cam[2],
 	    p->camera->target[0], p->camera->target[1], p->camera->target[2],
 	    0, 0, 1);
+  glProfPhase(0);        /* setup/clear/perspective/lookat */
 
   drawFloor(d, p->camera->cam);
-  if(game->settings->show_wall == 1)
+  glProfPhase(1);        /* floor */
+  if(game->settings->show_wall == 1) {
     drawWalls(d);
+    glProfPhase(2);      /* walls */
+  }
   for(i = 0; i < game->players; i++)
     drawTraces(&(game->player[i]), d, i);
+  glProfPhase(3);        /* trails */
 
   drawPlayers(p);
+  glProfPhase(4);        /* bikes */
 
   /* draw the glow around the other players: */
   if(game->settings->show_glow == 1)
     for(i = 0; i < game->players; i++)
       if ((p != &(game->player[i])) && (game->player[i].data->speed > 0))
 	drawGlow(&(game->player[i]), d, TRAIL_HEIGHT * 4);
+  glProfPhase(5);        /* glow */
 
 
   /* highLight crashed player */
