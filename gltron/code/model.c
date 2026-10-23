@@ -12,6 +12,22 @@
 
 static Mesh *cycle_mesh;
 
+/* per-face jitter directions for the explosion path, folded into
+ * faceoff_q once at build time (kept here so the float fallback in
+ * drawExplosionPart shares the same table) */
+const float exp_vectors[EXP_VECTORS][3] = {
+  { 0.03, -0.06, -0.07 },
+  { 0.04, 0.08, -0.03 },
+  { 0.10, -0.04, -0.07 },
+  { 0.06, -0.09, -0.10 },
+  { -0.03, -0.05, 0.02 },
+  { 0.07, 0.08, -0.00 },
+  { 0.01, -0.04, 0.10 },
+  { -0.01, -0.07, 0.09 },
+  { 0.01, -0.01, -0.09 },
+  { -0.04, 0.04, 0.02 }
+};
+
 Mesh *psxBuildCycleModel(void)
 {
   Mesh *mesh;
@@ -24,6 +40,7 @@ Mesh *psxBuildCycleModel(void)
   const float *vs[4];
   const float *ns[4];
   float *dstv, *dstn;
+  int *dstvq, *dstoq;
 
   if (cycle_mesh)
     return cycle_mesh;                       /* built once, shared */
@@ -56,9 +73,18 @@ Mesh *psxBuildCycleModel(void)
     total = nf[i] * MODEL_FACESIZE * 3;
     dstv = (float *)malloc(total * sizeof(float));
     dstn = (float *)malloc(total * sizeof(float));
+    /* fixed-point mirrors for drawExplosionPart's hot path (see
+     * model.h) — one-time cost at boot, no soft-float per frame */
+    dstvq = (int *)malloc(total * sizeof(int));
+    dstoq = (int *)malloc(nf[i] * 3 * sizeof(int));
     vv = (const float (*)[4][3])vs[i];
     nn = (const float (*)[4][3])ns[i];
-    for (j = 0; j < nf[i]; j++)
+    for (j = 0; j < nf[i]; j++) {
+      /* per-face explosion offset: the face normal plus this
+       * face's jitter direction, pre-converted to Q16.16 */
+      for (k = 0; k < 3; k++)
+	dstoq[3 * j + k] =
+	  glQ16(nn[j][0][k] + exp_vectors[j % EXP_VECTORS][k]);
       for (k = 0; k < MODEL_FACESIZE; k++) {
 	int o = 3 * (j * MODEL_FACESIZE + k);
 
@@ -68,9 +94,15 @@ Mesh *psxBuildCycleModel(void)
 	dstn[o + 0] = nn[j][k][0];
 	dstn[o + 1] = nn[j][k][1];
 	dstn[o + 2] = nn[j][k][2];
+	dstvq[o + 0] = glQ16(vv[j][k][0]);
+	dstvq[o + 1] = glQ16(vv[j][k][1]);
+	dstvq[o + 2] = glQ16(vv[j][k][2]);
       }
+    }
     mp->vertices = dstv;
     mp->normals = dstn;
+    mp->vertices_q = dstvq;
+    mp->faceoff_q = dstoq;
   }
 
   cycle_mesh = mesh;
