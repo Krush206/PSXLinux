@@ -67,23 +67,13 @@ void drawExplosionPart(MeshPart* meshpart, float radius, int flag) {
   int i, j;
   int type = 0, c;
   int run = 0;
+  int rq, ox, oy, oz;
   float *normal;
   float *vertex;
+  const int *vq = meshpart->vertices_q;
+  const int *foq = meshpart->faceoff_q;
 
-#define EXP_VECTORS 10
-  float vectors[][3] = {
-    { 0.03, -0.06, -0.07 }, 
-    { 0.04, 0.08, -0.03 }, 
-    { 0.10, -0.04, -0.07 }, 
-    { 0.06, -0.09, -0.10 }, 
-    { -0.03, -0.05, 0.02 }, 
-    { 0.07, 0.08, -0.00 }, 
-    { 0.01, -0.04, 0.10 }, 
-    { -0.01, -0.07, 0.09 }, 
-    { 0.01, -0.01, -0.09 }, 
-    { -0.04, 0.04, 0.02 }
-  };
-
+  rq = glQ16(radius);
 
   for(i = 0; i < meshpart->nFaces; i++) {
     c = *(meshpart->facesizes + i);
@@ -93,23 +83,29 @@ void drawExplosionPart(MeshPart* meshpart, float radius, int flag) {
        * explosion offset is folded into the vertices instead of a
        * glPushMatrix/glTranslate/glPopMatrix per face, and the faces
        * share one GL_TRIANGLES batch per MESH_BATCH_FACES faces.
+       *
+       * Fixed point: vertices_q and the per-face offset direction
+       * (face normal + jitter, folded at model build — see model.c)
+       * are Q16.16, so scaling by the radius is one 64-bit
+       * multiply per axis per face and the per-vertex offset is an
+       * integer add.  The float version did a soft-float chain per
+       * component per face and per vertex - the single most
+       * expensive stretch of guest code during the crash cascade.
        */
-      float ox, oy, oz;
       if(run == MESH_BATCH_FACES) {
 	glEnd();
 	run = 0;
       }
       if(run == 0)
 	glBegin(GL_TRIANGLES);
-      normal = meshpart->normals + 3 * (i * MODEL_FACESIZE);
-      ox = radius * (*(normal + 0) + vectors[i % EXP_VECTORS][0]);
-      oy = radius * (*(normal + 1) + vectors[i % EXP_VECTORS][1]);
-      oz = radius * (*(normal + 2) + vectors[i % EXP_VECTORS][2]);
+      ox = (int)(((long long)rq * foq[3 * i + 0]) >> 16);
+      oy = (int)(((long long)rq * foq[3 * i + 1]) >> 16);
+      oz = (int)(((long long)rq * foq[3 * i + 2]) >> 16);
       for(j = 0; j < c; j++) {
-	normal = meshpart->normals + 3 * (i * MODEL_FACESIZE + j);
+	int o = 3 * (i * MODEL_FACESIZE + j);
+	normal = meshpart->normals + o;
 	glNormal3fv(normal);
-	vertex = meshpart->vertices + 3 * (i * MODEL_FACESIZE + j);
-	glVertex3f(vertex[0] + ox, vertex[1] + oy, vertex[2] + oz);
+	glVertex3q(vq[o + 0] + ox, vq[o + 1] + oy, vq[o + 2] + oz);
       }
       run++;
       continue;
@@ -124,9 +120,9 @@ void drawExplosionPart(MeshPart* meshpart, float radius, int flag) {
     if(type != 0) {
       glPushMatrix();
       normal = meshpart->normals + 3 * (i * MODEL_FACESIZE);
-      glTranslatef(radius * (*(normal + 0) + vectors[i % EXP_VECTORS][0]),
-		   radius * (*(normal + 1) + vectors[i % EXP_VECTORS][1]),
-		   radius * (*(normal + 2) + vectors[i % EXP_VECTORS][2]) );
+      glTranslatef(radius * (*(normal + 0) + exp_vectors[i % EXP_VECTORS][0]),
+		   radius * (*(normal + 1) + exp_vectors[i % EXP_VECTORS][1]),
+		   radius * (*(normal + 2) + exp_vectors[i % EXP_VECTORS][2]) );
 
       glBegin(type);
       for(j = 0; j < c; j++) {
