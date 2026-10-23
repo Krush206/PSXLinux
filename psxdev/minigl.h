@@ -120,6 +120,9 @@ void glVertex2f(GLfloat x, GLfloat y);
 void glVertex2i(GLint x, GLint y);
 void glVertex3f(GLfloat x, GLfloat y, GLfloat z);
 void glVertex3i(GLint x, GLint y, GLint z);
+/* raw Q16.16 vertex: coordinates already in fixed point (used by
+ * the pre-converted mesh paths; NOT world units like glVertex3i) */
+void glVertex3q(GLint x, GLint y, GLint z);
 void glVertex3fv(const GLfloat *v);
 void glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w);
 
@@ -130,6 +133,11 @@ void glColor4fv(const GLfloat *v);
 void glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a);
 
 void glTexCoord2f(GLfloat u, GLfloat v);
+/* float -> Q16.16, exposed for code that pre-converts static
+ * geometry at build time (see model.c); same rounding as the
+ * glVertex3f path so both paths agree bit for bit */
+int glQ16(GLfloat f);
+
 void glTexCoord2i(GLint u, GLint v);
 
 void glNormal3f(GLfloat x, GLfloat y, GLfloat z);
