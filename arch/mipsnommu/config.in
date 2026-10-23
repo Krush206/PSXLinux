@@ -235,6 +235,10 @@ if [ "$CONFIG_PLAYSTATION" = "y" ]; then
    if [ "$CONFIG_PSX_PIO_EXTENSION" = "y" ]; then
    	bool 'Enhanced Real Time Clock Support' CONFIG_RTC
    fi
+   tristate 'PlayStation GPU support' CONFIG_PSX_GPU
+   tristate 'PlayStation SPU (sound) support' CONFIG_PSX_SPU
+   tristate 'PlayStation Controller support' CONFIG_PSX_PAD
+   tristate 'PlayStation Memory Card support' CONFIG_PSX_MEMCARD
    endmenu
 fi
 
