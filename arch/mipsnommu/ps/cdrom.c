@@ -89,8 +89,11 @@ uint8_t cd_read_reply(uint8_t * reply_buffer) {
 
 	// Read reply
 	while (CD_REGS[0] & 0x20) {
-		*reply_buffer = CD_REGS[1];
-		reply_buffer++;
+		uint8_t b = CD_REGS[1];
+		if (reply_buffer) {
+			*reply_buffer = b;
+			reply_buffer++;
+		}
 		len++;
 	}
 
