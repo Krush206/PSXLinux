@@ -1,6 +1,11 @@
 #include "gltron.h"
 #include "geom.h"
 
+/* per-frame view-cull state, recomputed once in drawCam and shared
+ * by the floor and wall culls (see drawFloor): unit view direction
+ * in Q16.16 and the integer camera position */
+static int vcull_ok, vcull_vq[3], vcull_x, vcull_y, vcull_z;
+
 void drawDebugTex(gDisplay *d) {
   int x = 100;
   int y = 100;
@@ -28,42 +33,43 @@ void drawScore(Player *p, gDisplay *d) {
   drawText(5, 5, 32, tmp);
 }
   
-static int floor_splits(float cam, float *out)
+static int floor_splits(int cam, int *out)
 {
-  float pts[40];
+  int pts[40];
   int n = 0, m = 0, i, k;
 
-  pts[n++] = 0.0f;
+  pts[n++] = 0;
   for(k = 0; k <= 6; k++) {
-    float s = (float)(1 << k);
-    float a = cam - s, b = cam + s;
-    if(a > 0.5f && a < (float)GSIZE - 0.5f) pts[n++] = a;
-    if(b > 0.5f && b < (float)GSIZE - 0.5f) pts[n++] = b;
+    int s = 1 << k;
+    int a = cam - s, b = cam + s;
+    if(a > 0 && a < GSIZE) pts[n++] = a;
+    if(b > 0 && b < GSIZE) pts[n++] = b;
   }
-  if(cam > 0.5f && cam < (float)GSIZE - 0.5f)
+  if(cam > 0 && cam < GSIZE)
     pts[n++] = cam;
-  pts[n++] = (float)GSIZE;
+  pts[n++] = GSIZE;
   /* insertion sort */
   for(i = 1; i < n; i++) {
-    float v = pts[i];
+    int v = pts[i];
     int j = i - 1;
     while(j >= 0 && pts[j] > v) { pts[j + 1] = pts[j]; j--; }
     pts[j + 1] = v;
   }
   /* dedupe */
   for(i = 0; i < n; i++)
-    if(m == 0 || pts[i] - out[m - 1] > 0.25f)
+    if(m == 0 || pts[i] - out[m - 1] >= 1)
       out[m++] = pts[i];
-  /* cap cell size at 36 units (far cells cover few pixels each;
+  /* cap cell size at 64 units (far cells cover few pixels each;
    * the affine stretch only matters for near cells, which stay
-   * split small) */
+   * split small - and far cells are the expensive ones: each
+   * projects far off screen and pays a full clip pass) */
   i = 0;
   while(i < m - 1) {
-    if(out[i + 1] - out[i] > 36.0f && m < 38) {
+    if(out[i + 1] - out[i] > 64 && m < 38) {
       int j;
       for(j = m; j > i + 1; j--)
 	out[j] = out[j - 1];
-      out[i + 1] = (out[i] + out[i + 2]) * 0.5f;
+      out[i + 1] = (out[i] + out[i + 2]) / 2;
       m++;
     } else
       i++;
@@ -71,9 +77,11 @@ static int floor_splits(float cam, float *out)
   return m;
 }
 
-void drawFloor(gDisplay *d, float *cam) {
-  float xs[40], ys[40];
+void drawFloor(gDisplay *d, Player *p) {
+  int xs[40], ys[40];
+  float u[40], v[40];
   int nx, ny, i, j;
+  float *cam = p->camera->cam;
 
   if(game->settings->show_floor_texture) {
     glDepthMask(GL_TRUE);
@@ -93,24 +101,69 @@ void drawFloor(gDisplay *d, float *cam) {
      * that quad's own phase, so the graded split points do not
      * need to align with repeat edges. */
     glColor4f(1.0, 1.0, 1.0, 1.0);
-    nx = floor_splits(cam ? cam[0] : 100.0f, xs);
-    ny = floor_splits(cam ? cam[1] : 100.0f, ys);
-    for(i = 0; i < nx - 1; i++)
-      for(j = 0; j < ny - 1; j++) {
-	int x0 = (int)(xs[i] + 0.5f);
-	int x1 = (int)(xs[i + 1] + 0.5f);
-	int y0 = (int)(ys[j] + 0.5f);
-	int y1 = (int)(ys[j + 1] + 0.5f);
-	if(x0 == x1 || y0 == y1)
-	  continue;
-	glBegin(GL_QUADS);
-	glTexCoord2f(x0 * 0.1f, y0 * 0.1f); glVertex2i(x0, y0);
-	glTexCoord2f(x1 * 0.1f, y0 * 0.1f); glVertex2i(x1, y0);
-	glTexCoord2f(x1 * 0.1f, y1 * 0.1f); glVertex2i(x1, y1);
-	glTexCoord2f(x0 * 0.1f, y1 * 0.1f); glVertex2i(x0, y1);
+    nx = floor_splits((int)(cam[0] + 0.5f), xs);
+    ny = floor_splits((int)(cam[1] + 0.5f), ys);
+    /* x * 0.1f is one soft-float chain; compute the texcoords
+     * once per split point instead of once per quad corner
+     * (~300 quads x 4 corners used to be ~4800 soft-float
+     * calls per frame, the single largest floor cost). */
+    for(i = 0; i < nx; i++) u[i] = xs[i] * 0.1f;
+    for(j = 0; j < ny; j++) v[j] = ys[j] * 0.1f;
+    {
+      /* batch the cells 24 quads per glBegin/glEnd (minigl's
+       * 96-vertex buffer): the per-pair stage processing - packet
+       * setup, near/screen clip, emit - used to be paid once per
+       * quad and dwarfed the per-vertex transform cost.  All
+       * cells share colour, texture and blend state, so the
+       * batching is invisible. */
+      int nb = 0;
+      for(i = 0; i < nx - 1; i++)
+	for(j = 0; j < ny - 1; j++) {
+	  int diag, cxc, cyc, r2, dot, d2;
+
+	  if(xs[i] == xs[i + 1] || ys[j] == ys[j + 1])
+	    continue;
+	  /* conservative view cull, all integer: a cell whose center
+	   * is behind the camera plane by more than its diagonal has
+	   * every corner behind the plane (moving a corner from the
+	   * center changes the dot by at most half the diagonal and
+	   * the view vector is unit length), and the cone test keeps
+	   * everything within ~75 degrees of the view axis - wider
+	   * than the screen ever needs (fov 105 => 52.5 degrees to
+	   * the edges, ~75 including the far screen corners), with
+	   * the diagonal folded in for near cells.  Culling a cell
+	   * skips four fixed-point transforms, its packet and the
+	   * screen clipper - the bulk of the floor cost. */
+	  if(vcull_ok) {
+	    diag = (xs[i + 1] - xs[i]) + (ys[j + 1] - ys[j]);
+	    cxc = (xs[i] + xs[i + 1]) / 2 - vcull_x;
+	    cyc = (ys[j] + ys[j + 1]) / 2 - vcull_y;
+	    dot = (int)(((long long)cxc * vcull_vq[0] +
+			 (long long)cyc * vcull_vq[1] -
+			 (long long)vcull_z * vcull_vq[2]) >> 16);
+	    if(dot < -diag)
+	      continue;                     /* fully behind the camera */
+	    r2 = cxc * cxc + cyc * cyc + vcull_z * vcull_z;
+	    d2 = dot + diag;                 /* margin for the cell body */
+	    if(16 * d2 * d2 < r2)
+	      continue;                     /* far outside the view cone */
+	  }
+	  if(nb == 0)
+	    glBegin(GL_QUADS);
+	  glTexCoord2f(u[i], v[j]); glVertex2i(xs[i], ys[j]);
+	  glTexCoord2f(u[i + 1], v[j]); glVertex2i(xs[i + 1], ys[j]);
+	  glTexCoord2f(u[i + 1], v[j + 1]); glVertex2i(xs[i + 1], ys[j + 1]);
+	  glTexCoord2f(u[i], v[j + 1]); glVertex2i(xs[i], ys[j + 1]);
+	  polycount++;
+	  nb++;
+	  if(nb == 24) {
+	    glEnd();
+	    nb = 0;
+	  }
+	}
+      if(nb)
 	glEnd();
-	polycount++;
-      }
+    }
     glDisable(GL_TEXTURE_2D);
     glDepthMask(GL_FALSE);
   } else {
@@ -286,7 +339,15 @@ void drawCycle(Player *p, float *cam) {
     alpha = (float) (EXP_RADIUS_MAX - p->data->exp_radius) /
       (float) EXP_RADIUS_MAX;
     setMaterialAlphas(cycle, alpha);
+    /* cull the explosion shell like the closed hull: the faces
+     * are displaced outward along their normals, so the back
+     * faces sit behind the front ones and the depth test (or
+     * the blend) hides them - drawing them doubled the
+     * primitive count of the most expensive phase in the
+     * game. */
+    glEnable(GL_CULL_FACE);
     drawExplosion(cycle, p->data->exp_radius, MODEL_USE_MATERIAL, 0);
+    glDisable(GL_CULL_FACE);
   }
 
   if(game->settings->show_alpha == 0) glDisable(GL_BLEND);
@@ -372,7 +433,16 @@ void drawPlayers(Player *p) {
       glPopMatrix();
     }
     if(playerVisible(p, &(game->player[i]))) {
-      if(game->settings->show_model)
+      /* distance LOD (see the CYCLE_DRAW_DIST2 comment above):
+       * past 120 units skip drawCycle entirely - base quad, trail
+       * and crash animation included.  During the crash cascade
+       * the exploding models are by far the heaviest thing on
+       * screen, and distant ones cover only a few pixels. */
+      float dx = p->camera->cam[0] - game->player[i].data->posx;
+      float dy = p->camera->cam[1] - game->player[i].data->posy;
+      float dz = p->camera->cam[2];
+      if(game->settings->show_model &&
+	 dx * dx + dy * dy + dz * dz < CYCLE_DRAW_DIST2)
 	drawCycle(&(game->player[i]), p->camera->cam);
     }
   }
@@ -444,9 +514,9 @@ void drawGlow(Player *p, gDisplay *d, float dim) {
 }
 
 void drawWalls(gDisplay *d) {
-  float t = 4;                  /* 4 repeats over 200 units, as upstream */
   int seg;
 #define WALL_SEGS 8
+#define WALL_STEP (GSIZE / WALL_SEGS)
   glColor4f(1.0, 1.0, 1.0, 1.0);
   glDisable(GL_BLEND);
 
@@ -459,48 +529,102 @@ void drawWalls(gDisplay *d) {
   glBegin(GL_QUADS);
   /* Each 200-unit wall is emitted in 25-unit segments: the PSX GPU
    * maps textures affinely per quad, so one quad spanning the whole
-   * arena shears its texture along the view direction. */
+   * arena shears its texture along the view direction.
+   *
+   * Integer coordinates and texcoords: 25-unit position steps and
+   * half-repeat UV steps (4 repeats over 200 units = 128 Q8 units
+   * per segment) are exact, so the per-corner soft-float chains
+   * (~200 per frame) are gone.  Segments the camera cannot see are
+   * skipped with the same conservative integer test the floor uses
+   * (see drawFloor): behind-plane by more than the segment extent,
+   * or outside a ~75 degree cone around the view axis with the
+   * extent folded in. */
   for(seg = 0; seg < WALL_SEGS; seg++) {
-    float f0 = (float)seg / WALL_SEGS, f1 = (float)(seg + 1) / WALL_SEGS;
+    int p0 = seg * WALL_STEP, p1 = (seg + 1) * WALL_STEP;
+    int diag = WALL_STEP + WALL_H;
+    int cxc, cyc, czc, r2, dot, d2;
+
+    if(vcull_ok) {
+      /* segment centres: mid-position, mid-height on the wall */
+      czc = WALL_H / 2 - vcull_z;
+      /* along +x at y=0 */
+      cxc = p0 + WALL_STEP / 2 - vcull_x;
+      cyc = 0 - vcull_y;
+      dot = (int)(((long long)cxc * vcull_vq[0] +
+		   (long long)cyc * vcull_vq[1] +
+		   (long long)czc * vcull_vq[2]) >> 16);
+      r2 = cxc * cxc + cyc * cyc + czc * czc;
+      d2 = dot + diag;
+      if(dot < -diag || 16 * d2 * d2 < r2)
+	goto next_seg;
+      /* along +y at x=GSIZE */
+      cxc = GSIZE - vcull_x;
+      cyc = p0 + WALL_STEP / 2 - vcull_y;
+      dot = (int)(((long long)cxc * vcull_vq[0] +
+		   (long long)cyc * vcull_vq[1] +
+		   (long long)czc * vcull_vq[2]) >> 16);
+      r2 = cxc * cxc + cyc * cyc + czc * czc;
+      d2 = dot + diag;
+      if(dot < -diag || 16 * d2 * d2 < r2)
+	goto next_seg;
+      /* along -x at y=GSIZE */
+      cxc = p0 + WALL_STEP / 2 - vcull_x;
+      cyc = GSIZE - vcull_y;
+      dot = (int)(((long long)cxc * vcull_vq[0] +
+		   (long long)cyc * vcull_vq[1] +
+		   (long long)czc * vcull_vq[2]) >> 16);
+      r2 = cxc * cxc + cyc * cyc + czc * czc;
+      d2 = dot + diag;
+      if(dot < -diag || 16 * d2 * d2 < r2)
+	goto next_seg;
+      /* along -y at x=0 */
+      cxc = 0 - vcull_x;
+      cyc = p0 + WALL_STEP / 2 - vcull_y;
+      dot = (int)(((long long)cxc * vcull_vq[0] +
+		   (long long)cyc * vcull_vq[1] +
+		   (long long)czc * vcull_vq[2]) >> 16);
+      r2 = cxc * cxc + cyc * cyc + czc * czc;
+      d2 = dot + diag;
+      if(dot < -diag || 16 * d2 * d2 < r2)
+	goto next_seg;
+    }
     /* along +x at y=0: u = t at x=0 .. 0 at x=GSIZE */
     {
-      float x0 = GSIZE * f0, x1 = GSIZE * f1;
-      float u0 = t * (1.0f - f0), u1 = t * (1.0f - f1);
-      glTexCoord2f(u0, 0.0); glVertex3f(x0, 0.0, 0.0);
-      glTexCoord2f(u0, 1.0); glVertex3f(x0, 0.0, WALL_H);
-      glTexCoord2f(u1, 1.0); glVertex3f(x1, 0.0, WALL_H);
-      glTexCoord2f(u1, 0.0); glVertex3f(x1, 0.0, 0.0);
+      int u0 = (WALL_SEGS - seg) << 7, u1 = (WALL_SEGS - seg - 1) << 7;
+      glTexCoord2i(u0, 0); glVertex3i(p0, 0, 0);
+      glTexCoord2i(u0, 256); glVertex3i(p0, 0, WALL_H);
+      glTexCoord2i(u1, 256); glVertex3i(p1, 0, WALL_H);
+      glTexCoord2i(u1, 0); glVertex3i(p1, 0, 0);
     }
     /* along +y at x=GSIZE: u = t at y=0 .. 0 at y=GSIZE */
     {
-      float y0 = GSIZE * f0, y1 = GSIZE * f1;
-      float u0 = t * (1.0f - f0), u1 = t * (1.0f - f1);
-      glTexCoord2f(u0, 1.0); glVertex3f(GSIZE, y0, 0.0);
-      glTexCoord2f(u0, 0.0); glVertex3f(GSIZE, y0, WALL_H);
-      glTexCoord2f(u1, 0.0); glVertex3f(GSIZE, y1, WALL_H);
-      glTexCoord2f(u1, 1.0); glVertex3f(GSIZE, y1, 0.0);
+      int u0 = (WALL_SEGS - seg) << 7, u1 = (WALL_SEGS - seg - 1) << 7;
+      glTexCoord2i(u0, 256); glVertex3i(GSIZE, p0, 0);
+      glTexCoord2i(u0, 0); glVertex3i(GSIZE, p0, WALL_H);
+      glTexCoord2i(u1, 0); glVertex3i(GSIZE, p1, WALL_H);
+      glTexCoord2i(u1, 256); glVertex3i(GSIZE, p1, 0);
     }
     /* along -x at y=GSIZE: u = t at x=GSIZE .. 0 at x=0 */
     {
-      float x0 = GSIZE * f1, x1 = GSIZE * f0;
-      float u0 = t * f1, u1 = t * f0;
-      glTexCoord2f(u0, 1.0); glVertex3f(x0, GSIZE, 0.0);
-      glTexCoord2f(u0, 0.0); glVertex3f(x0, GSIZE, WALL_H);
-      glTexCoord2f(u1, 0.0); glVertex3f(x1, GSIZE, WALL_H);
-      glTexCoord2f(u1, 1.0); glVertex3f(x1, GSIZE, 0.0);
+      int u0 = (seg + 1) << 7, u1 = seg << 7;
+      glTexCoord2i(u0, 256); glVertex3i(p1, GSIZE, 0);
+      glTexCoord2i(u0, 0); glVertex3i(p1, GSIZE, WALL_H);
+      glTexCoord2i(u1, 0); glVertex3i(p0, GSIZE, WALL_H);
+      glTexCoord2i(u1, 256); glVertex3i(p0, GSIZE, 0);
     }
     /* along -y at x=0: u = t at y=GSIZE .. 0 at y=0 */
     {
-      float y0 = GSIZE * f1, y1 = GSIZE * f0;
-      float u0 = t * f1, u1 = t * f0;
-      glTexCoord2f(u0, 1.0); glVertex3f(0.0, y0, 0.0);
-      glTexCoord2f(u0, 0.0); glVertex3f(0.0, y0, WALL_H);
-      glTexCoord2f(u1, 0.0); glVertex3f(0.0, y1, WALL_H);
-      glTexCoord2f(u1, 1.0); glVertex3f(0.0, y1, 0.0);
+      int u0 = (seg + 1) << 7, u1 = seg << 7;
+      glTexCoord2i(u0, 256); glVertex3i(0, p1, 0);
+      glTexCoord2i(u0, 0); glVertex3i(0, p1, WALL_H);
+      glTexCoord2i(u1, 0); glVertex3i(0, p0, WALL_H);
+      glTexCoord2i(u1, 256); glVertex3i(0, p0, 0);
     }
+    polycount += 4;
+next_seg:
+    ;
   }
   glEnd();
-  polycount += 4 * WALL_SEGS;
 
   glDisable(GL_TEXTURE_2D);
 
@@ -556,9 +680,27 @@ void drawCam(Player *p, gDisplay *d) {
   gluLookAt(p->camera->cam[0], p->camera->cam[1], p->camera->cam[2],
 	    p->camera->target[0], p->camera->target[1], p->camera->target[2],
 	    0, 0, 1);
+  /* per-frame view-cull state for the floor and wall culls */
+  {
+    float vd[3];
+
+    vd[0] = p->camera->target[0] - p->camera->cam[0];
+    vd[1] = p->camera->target[1] - p->camera->cam[1];
+    vd[2] = p->camera->target[2] - p->camera->cam[2];
+    vcull_ok = (vd[0] != 0 || vd[1] != 0 || vd[2] != 0);
+    if(vcull_ok) {
+      normalize(vd);
+      vcull_vq[0] = glQ16(vd[0]);
+      vcull_vq[1] = glQ16(vd[1]);
+      vcull_vq[2] = glQ16(vd[2]);
+    }
+  }
+  vcull_x = (int)p->camera->cam[0];
+  vcull_y = (int)p->camera->cam[1];
+  vcull_z = (int)p->camera->cam[2];
   glProfPhase(0);        /* setup/clear/perspective/lookat */
 
-  drawFloor(d, p->camera->cam);
+  drawFloor(d, p);
   glProfPhase(1);        /* floor */
   if(game->settings->show_wall == 1) {
     drawWalls(d);
