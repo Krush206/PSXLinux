@@ -50,35 +50,51 @@ void ftxEstablishTexture(fonttex *ftx, unsigned char setupMipmaps)
 void ftxRenderString(fonttex *ftx, char *string, int len)
 {
   int i;
-  float cu = (float)CELL_W / (float)FONT_SHEET_W;   /* 0.125 */
-  float cv = (float)CELL_H / (float)FONT_SHEET_H;   /* 0.0625 */
+  int in_batch = 0;
 
   if (!font_built)
     ftxEstablishTexture(ftx, 0);
   glBindTexture(GL_TEXTURE_2D, ftx->texID);
 
+  /* Batched and fully integer: one glBegin per 20 characters
+   * (80 verts, inside minigl's 96-vertex buffer) instead of one
+   * glBegin/glEnd pair per character, and the cell coordinates
+   * come out of the glyph index with shifts - 8 columns of
+   * 1/8 sheet width (32 units in minigl's Q8 texcoords) by 16
+   * rows of 1/16 sheet height (16 units).  The float version
+   * paid a soft-float divide per character and a GPU packet per
+   * character. */
   for (i = 0; i < len; i++) {
     int index = string[i] - ftx->lower + 1;   /* matches generator */
-    float cx, cy;
+    int gx, gy, u0, u1, v0, v1;
 
     if (index < 1 || index > 95)
       continue;                          /* unmapped character */
 
-    cx = (float)(index % CELL_COLS) / (float)CELL_COLS;
-    cy = (float)(index / CELL_COLS) * cv;
+    if ((i % 20) == 0) {
+      if (in_batch)
+	glEnd();
+      glBegin(GL_QUADS);
+      in_batch = 1;
+    }
+
+    gx = index % CELL_COLS;
+    gy = index / CELL_COLS;
+    u0 = gx << 5; u1 = (gx + 1) << 5;    /* 32 Q8 units per cell */
+    v0 = gy << 4; v1 = (gy + 1) << 4;    /* 16 Q8 units per cell */
 
     /* No V flip: glTexImage2DPSX uploads the sheet's first array
      * row to VRAM v=0, so texture v grows downward through the
      * sheet exactly as the generator laid the cells out.  (The
      * 1.0-cy flip from the GL bottom-up convention sampled
      * mirrored, mostly empty cells - garbled glyphs.)  The quad's
-     * bottom (y=0) takes the cell's bottom row (cy+cv), the top
-     * (y=1) the cell's top row (cy). */
-    glBegin(GL_QUADS);
-    glTexCoord2f(cx,       cy + cv); glVertex2f((float)i,       0.0f);
-    glTexCoord2f(cx + cu,  cy + cv); glVertex2f((float)i + 1.0f, 0.0f);
-    glTexCoord2f(cx + cu,  cy);      glVertex2f((float)i + 1.0f, 1.0f);
-    glTexCoord2f(cx,       cy);      glVertex2f((float)i,       1.0f);
-    glEnd();
+     * bottom (y=0) takes the cell's bottom row (v1), the top
+     * (y=1) the cell's top row (v0). */
+    glTexCoord2i(u0, v1); glVertex2i(i, 0);
+    glTexCoord2i(u1, v1); glVertex2i(i + 1, 0);
+    glTexCoord2i(u1, v0); glVertex2i(i + 1, 1);
+    glTexCoord2i(u0, v0); glVertex2i(i, 1);
   }
+  if (in_batch)
+    glEnd();
 }
