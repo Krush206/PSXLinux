@@ -112,6 +112,8 @@ obj-$(CONFIG_SERIAL_PSX) += serial_psx.o
 obj-$(CONFIG_SERIAL_PSX_CONSOLE) += ../../arch/mipsnommu/ps/siocon.o
 obj-$(CONFIG_PSX_SPU) += psxspu.o
 obj-$(CONFIG_PSX_GPU) += psxgpu.o
+obj-$(CONFIG_PSX_PAD) += psxpad.o
+obj-$(CONFIG_PSX_MEMCARD) += psxmemcard.o
 
 ifndef CONFIG_SUN_KEYBOARD
   obj-$(CONFIG_VT) += keyboard.o $(KEYMAP) $(KEYBD)
