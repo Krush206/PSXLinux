@@ -1178,6 +1178,23 @@ void glVertex3i(GLint x, GLint y, GLint z)
 	v->nx = cur_normal[0]; v->ny = cur_normal[1]; v->nz = cur_normal[2];
 }
 
+/* Raw Q16.16 vertex: coordinates arrive pre-converted (and possibly
+ * pre-summed, as in the fixed-point explosion path) so the hot path
+ * is three integer stores — no float conversion at all. */
+void glVertex3q(GLint x, GLint y, GLint z)
+{
+	Vtx *v;
+
+	if (!in_begin || prim_n >= MAX_VERTS)
+		return;
+	v = &verts[prim_n++];
+	v->x = x; v->y = y; v->z = z;
+	v->r8 = cur_color[0]; v->g8 = cur_color[1];
+	v->b8 = cur_color[2]; v->a8 = cur_color[3];
+	v->u = cur_uv[0];    v->v = cur_uv[1];
+	v->nx = cur_normal[0]; v->ny = cur_normal[1]; v->nz = cur_normal[2];
+}
+
 void glVertex3fv(const GLfloat *p)
 {
 	glVertex3f(p[0], p[1], p[2]);
@@ -1276,6 +1293,11 @@ static int f2q(float f, int bits)
 		r = m >> -e;               /* tiny |f|: rounds toward 0 */
 	}
 	return (u.i & 0x80000000u) ? -r : r;
+}
+
+int glQ16(GLfloat f)
+{
+	return f2q(f, 16);
 }
 
 /* --------------------------------------------------- fixed point state */
@@ -1874,13 +1896,29 @@ static int clip_screen(Vtx *v, int n)
 	if (lo_y < 0) lo_y = 0;
 	lim[0] = lo_x; lim[1] = hi_x; lim[2] = lo_y; lim[3] = hi_y;
 
-	/* quick accept: already inside the viewport */
-	for (i = 0; i < n; i++)
-		if (src[i].sx < lo_x || src[i].sx > hi_x ||
-		    src[i].sy < lo_y || src[i].sy > hi_y)
-			break;
-	if (i == n)
-		return n;
+	/* quick accept: already inside the viewport; quick reject:
+	 * entirely outside one edge.  The reject matters for the
+	 * big far floor cells: they project far past the viewport,
+	 * and without it the Sutherland-Hodgman walk (four passes,
+	 * lerps and 68-byte vertex copies per crossing) ran on
+	 * every one of them just to produce nothing. */
+	{
+		int all_lo_x = 1, all_hi_x = 1, all_lo_y = 1, all_hi_y = 1;
+
+		for (i = 0; i < n; i++) {
+			if (src[i].sx < lo_x || src[i].sx > hi_x ||
+			    src[i].sy < lo_y || src[i].sy > hi_y)
+				break;
+			if (src[i].sx >= lo_x) all_lo_x = 0;
+			if (src[i].sx <= hi_x) all_hi_x = 0;
+			if (src[i].sy >= lo_y) all_lo_y = 0;
+			if (src[i].sy <= hi_y) all_hi_y = 0;
+		}
+		if (i == n)
+			return n;
+		if (all_lo_x || all_hi_x || all_lo_y || all_hi_y)
+			return 0;
+	}
 	st_sclip++;		/* full S-H path taken */
 
 	if (n == 2) {
