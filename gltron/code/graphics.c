@@ -25,9 +25,16 @@ void drawFPS(gDisplay *d) {
   static int pos = -FPS_HSIZE;
   static int fps_min = 0;
   static int fps_avg = 0;
+  static int fps_skip = 0;
 
   char tmp[20];
   int diff;
+
+  /* the readout costs ~6ms/frame (rasonly's double glOrtho, the
+   * sprintfs and two text runs); redrawing it 4 times a second is
+   * plenty for a number that moves that slowly */
+  if(fps_skip++ % 4)
+    return;
 
   rasonly(d);
   diff = (dt > 0) ? dt : 1;
