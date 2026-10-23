@@ -126,12 +126,8 @@ static int psxcd_read_sector(unsigned long lba, char *buf) {
      * start" (case 0), not "ack Stat" (case 1) */
     cd_set_page(0);
     CD_REGS[3] = 0x80;
-    /* Skip the sector sync + header to reach the 2048-byte user data.
-     * pTransfer starts at Transfer+12 (the fake header created by
-     * cdriso's cdread_2048); the actual user data is at Transfer+24,
-     * so skip 12 bytes. */
-    for (i = 0; i < 12; i++)
-        (void) CD_REGS[2];
+    /* Sector data starts at Transfer+0: with Setmode size 2048 the
+     * drive's data port yields pure user data (psx-spx RDDATA) */
     for (i = 0; i < PSXCD_HARDSECSIZE; i++)
         buf[i] = CD_REGS[2];
 
